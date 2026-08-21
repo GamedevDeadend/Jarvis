@@ -1,2 +1,2 @@
 # Jarvis
-Multiple AI Agents orchestrated workflow for automating desktop
+Multiple AI Agents orchestrated workflow for automating desktop.
