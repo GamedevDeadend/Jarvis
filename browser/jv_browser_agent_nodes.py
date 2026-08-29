@@ -372,6 +372,12 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
                 f"Last error: {error}"
             ),
         }
+    else :
+        return {
+            "ref_validation_error": error,
+            "ref_validation_count": new_count,
+        }
+        
 
 def end_message_node(state: BrowserAgentState) -> dict:
     """Sets the final end_reason and final_answer once the loop is done.
