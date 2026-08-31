@@ -2,12 +2,15 @@
 
 import time
 from moonshine_voice import MicTranscriber, TranscriptEventListener
+from browser.jv_browser_agent_graph import run_browser_agent
 
 
 class MicListener(TranscriptEventListener):
 
     def on_line_completed(self, event):
         print(f"Line completed: {event.line.text}")
+        run_browser_agent(event.line.text)
+
 
 
 # MicTranscriber handles connecting to the microphone, capturing the audio
