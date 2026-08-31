@@ -113,10 +113,13 @@ async def browser_snapshot(runtime: ToolRuntime) -> Command:
     snap = await session.snapshot()
     snapshot_text = snap.tree_text
 
+    step_count = runtime.state.get("step_count", 0) + 1
+
     return Command(
         update={
             "last_snapshot": snapshot_text,
             "last_snapshot_taken": True,
+            "step_count": step_count,
             "messages": [
                 ToolMessage(
                     content=snapshot_text,
@@ -179,12 +182,18 @@ async def browser_click(ref: str, runtime: ToolRuntime) -> Command:
 
 @tool
 async def browser_type(ref: str, text: str, submit: bool = False, runtime: ToolRuntime = None) -> Command:
-    """Type text into an input element on the page by its ref.
-
+    """ Type text into an input element on the page by its ref.
+        To perform a search: ALWAYS set submit=True in the SAME call that types
+        the search text. Do NOT type first and click a separate button afterward
+        that is unreliable and unnecessary. This tool submits the form/search
+        directly via submit=True.
     Args:
         ref: The ref TOKEN from the most recent browser_snapshot output
-        text: Text to type into the element
-        submit: If True, submits the form/search after typing (e.g. presses Enter)
+             text: Text to type into the element
+             
+        submit: Set True to submit immediately after typing (e.g. pressesEnter).
+                Use this for ALL searches — do not click a search
+                button separately.
     """
     session = await _get_session()
     result = await session.type(ref, text, submit=submit)

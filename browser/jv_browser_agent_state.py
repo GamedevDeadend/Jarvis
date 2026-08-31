@@ -5,17 +5,20 @@ State schema for the Browser Agent's perceive-act-verify LangGraph loop.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal, TypedDict, Sequence
 
 from langchain.messages import AnyMessage
 from langgraph.graph.message import add_messages
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 class BrowserAgentState(TypedDict):
     """Full shared state for one Browser agent task run.
     """
 
-    messages: Annotated[list[AnyMessage], add_messages]
+    messages: Annotated[Sequence[AnyMessage], add_messages]
 
     goal: str
     max_steps: int
@@ -41,18 +44,27 @@ def initial_state(
     max_steps: int = 12,
 ) -> BrowserAgentState:
     """Build a fresh state dict for a new Browser agent task."""
+
+    logger.info(f"Building Intial State for agent to complete this goal \n\n {goal} \n\n")
+
     return BrowserAgentState(
         messages=[],
-        goal=goal,
-        max_steps=max_steps,
+
         _start_url=start_url,
+        goal=goal,
+
+        step_count=0,
+        max_steps=max_steps,
+        
         last_snapshot="",
         last_snapshot_taken=False,
-        pending_action=None,
-        ref_validation_error=None,
+
         last_action_result=None,
-        step_count=0,
+        pending_action=None,
+
+        ref_validation_error=None,
+        ref_validation_count = 0,
+        
         end_reason=None,
-        final_answer=None,
-        ref_validation_count = 0
+        final_answer=None
     )

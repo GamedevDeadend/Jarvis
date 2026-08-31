@@ -10,9 +10,7 @@ Design principles carried over from browser_tools.py and browser_agent_state.py:
   - Decider_Node picks exactly ONE next tool call. It does not execute
     anything and does not judge success/failure — single narrow job.
   - Ref_Validator_Node is PURE CODE, no LLM call. It checks the proposed
-    ref's role (from the last snapshot) against what the action needs,
-    catching the exact "e29 is a combobox option, not a searchbox" bug
-    found in real testing — deterministically, for free.
+    ref's role (from the last snapshot) against what the action needs.
   - Should_Continue / Outcome_Router is one function (LangGraph
     conditional edge), not two separate LLM nodes: it reads
     last_action_result + step_count + max_steps and routes on code logic
@@ -36,8 +34,13 @@ from langchain.messages import SystemMessage, HumanMessage
 
 from langchain_ollama import ChatOllama
 
-from jv_browser_agent_state import BrowserAgentState
-from jv_browser_agent_tools import BROWSER_TOOLS, _get_session
+from browser.jv_browser_agent_state import BrowserAgentState
+from browser.jv_browser_agent_tools import BROWSER_TOOLS, _get_session
+
+from pydantic import BaseModel, Field 
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 MODEL_ID = "qwen2.5:3b"
@@ -50,88 +53,13 @@ EXPECTED_ROLES = {
 }
 
 
-async def initial_navigate_node(state: BrowserAgentState, config=None, *, store=None) -> dict:
-    """
-        Query -> Initial navigate. Hardcoded, not Decider-driven: step zero
-        always opens the target site, so there's no need to spend an LLM call
-        deciding to do the obvious first action.
-    """
-
-    print("\n\n Initial navigation node called")
-
-    url = state.get("_start_url", "https://www.wikipedia.org")
-
-    session = await _get_session()
-    result = await session.navigate(url)
-    success = getattr(result, "success", True)
-    error = getattr(result, "error", None)
-
-    return {
-        "last_snapshot_taken": False,
-        "last_action_result": {"success": success, "error": error, "url": url if success else None},
-        "step_count": state.get("step_count", 0) + 1,
-    }
-
-
-async def observer_node(state: BrowserAgentState) -> dict:
-    """Takes a snapshot only, via the real browser_snapshot @tool through
-    a one-off ToolNode. Same reasoning as initial_navigate_node above --
-    separated from decision-making so this node's sole job is perception,
-    never judgment.
-    """
-
-    print(f"\n\n Observer node called {state['pending_action']}")
-
-    session = await _get_session()
-    snap = await session.snapshot()
-
-    await asyncio.sleep(2)
-
-    print("\n\n Snapshot take \n\n" + snap.tree_text[:500] + "\n\n")
-
-    return {
-        "last_snapshot": snap.tree_text,
-        "last_snapshot_taken": True,
-    }
-
-
-ROLE_CHECK_PROMPT = """Snapshot:
-{snapshot}
-
-What is the accessibility role of the element with ref={ref}? 
-Respond with ONLY the role word (e.g. "link", "button", "searchbox", "combobox"). 
-If ref={ref} does not appear in the snapshot, respond with exactly: NOT_FOUND"""
-
-async def _parse_ref_roles(snapshot_text: str, ref : str) -> str | None:
-    """Ask the LLM what role a specific ref has in the snapshot.
-
-    Returns the role string (e.g. "link", "searchbox"), or None if the
-    ref wasn't found. Replaces the old regex-based _parse_ref_roles,
-    since real testing showed the snapshot format varies too much
-    across sites (unlabeled elements, wrapped multi-line labels) for a
-    single regex to reliably cover.
-    """
-
-    print(f"\n\n Ref Parser function called {snapshot_text}")
-
-    model = ChatOllama(model=MODEL_ID, temperature=0)
-
-    messages = [
-        SystemMessage(content=ROLE_CHECK_PROMPT.format(snapshot=snapshot_text, ref=ref)),
-        HumanMessage(content=f"ref={ref}"),
-    ]
-
-    response = await model.ainvoke(messages)
-    role = response.content.strip()
-
-    print(f"[ref_role_check] ref={ref!r} -> {role!r}")
-
-    if role == "NOT_FOUND" or not role:
-        return None
-    
-    return role
-
-
+class IntialParsingSchema(BaseModel) :
+    initial_url : str  = Field(description="Initial url which agent should navigate to start the process . Example https://www.youtube.com, https://www.wikipedia.org ")
+    goal_steps : str = Field(description="""Steps to reach goal in query. Break Goal in steps. STEPS:
+                                1. <first step>
+                                2. <second step>
+                                3. <third step>
+                                ...""")
 
 
 INITIAL_PARSING_SYSTEM_PROMPT = """Break the goal into two things: the starting website, and an ordered list of steps to reach the answer.
@@ -158,7 +86,7 @@ Goal: "Play Sparkle from Your Name movie on YouTube."
 URL: https://www.youtube.com
 STEPS:
 1. Search for "Sparkle Your Name"
-2. Open the correct video from the search results
+2. Open the relevant video from the search results
 3. Confirm the video is playing
 
 Goal: "Go to https://duckduckgo.com and search for 'browsegrab'. Tell me the title of the first result."
@@ -173,15 +101,12 @@ If the goal is already a single simple action, output exactly one step."""
 
 
 async def initial_query_parse_node(state: BrowserAgentState) -> dict:
-    """Runs once, before initial_navigate_node. Uses a cheap LLM call to
+    """
+    Runs once, before initial_navigate_node. Uses a cheap LLM call to
     extract which site the goal implies AND break the goal into ordered
     steps, instead of requiring the caller to pass _start_url explicitly
     or leaving the Decider to infer the whole multi-step plan on its own.
 
-    The parsed steps are appended to the existing goal text (not tracked
-    as a separate state field) -- decider_node already reads state["goal"]
-    every turn, so no other wiring changes are needed. Falls back to
-    whatever _start_url/goal were already set if parsing fails.
     """
     model = ChatOllama(model=MODEL_ID, temperature=0)
 
@@ -190,37 +115,65 @@ async def initial_query_parse_node(state: BrowserAgentState) -> dict:
         HumanMessage(content=f'Goal: "{state["goal"]}"'),
     ]
 
-    response = await model.ainvoke(messages)
-    text = response.content.strip()
+    structured_llm = model.with_structured_output(IntialParsingSchema)
+    response : IntialParsingSchema = await structured_llm.ainvoke(messages)
 
-    url = None
-    goal_lines = []
-    in_steps = False
+    url = response.initial_url
+    goal_lines = state["goal"] + "\n" + response.goal_steps
 
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("URL:"):
-            url = line[len("URL:"):].strip()
-        elif line.startswith("STEPS:"):
-            in_steps = True
-        elif in_steps and line:
-            goal_lines.append(line)
+    logger.info(f" Initial url : {url} \n\n")
+    logger.info(f"Steps for Goal : \n{goal_lines}\n\n")
 
-    print(f"[initial_query_parse_node] goal={state['goal'][:60]!r} -> url={url!r} steps={goal_lines}")
 
-    update = {}
+    return {"_start_url" : url, "goal" : goal_lines}
 
-    if url and (url.startswith("http://") or url.startswith("https://")):
-        update["_start_url"] = url
-    else:
-        print(f"[initial_query_parse_node] REJECTED non-URL output, keeping existing _start_url")
 
-    if goal_lines:
-        update["goal"] = state["goal"] + "\n\nSteps:\n" + "\n".join(goal_lines)
-    else:
-        print(f"[initial_query_parse_node] No steps parsed, keeping original goal")
 
-    return update
+async def initial_navigate_node(state: BrowserAgentState, config=None, *, store=None) -> dict:
+    """
+        Query -> Initial navigate. Hardcoded, not Decider-driven: step zero
+        always opens the target site, so there's no need to spend an LLM call
+        deciding to do the obvious first action.
+    """
+
+    logger.info(f"Initial navigation node called with url = {state.get('_start_url')} \n\n")
+
+    url = state.get("_start_url", "https://www.wikipedia.org")
+
+    session = await _get_session()
+    result = await session.navigate(url)
+    success = getattr(result, "success", True)
+    error = getattr(result, "error", None)
+
+    logger.info(f"Navigation results :\n {result} \n\n")
+
+    return {
+        "last_snapshot_taken": False,
+        "last_action_result": {"success": success, "error": error, "url": url if success else None},
+        "step_count": state.get("step_count", 0) + 1,
+    }
+
+
+async def observer_node(state: BrowserAgentState) -> dict:
+    """Takes a snapshot only, via the real browser_snapshot @tool through
+    a one-off ToolNode. Same reasoning as initial_navigate_node above --
+    separated from decision-making so this node's sole job is perception,
+    never judgment.
+    """
+
+    logger.info(f"Observer node called {state['pending_action']} \n\n")
+
+    session = await _get_session()
+    snap = await session.snapshot()
+
+    await asyncio.sleep(1.5)
+
+    logger.info("Snapshot take \n\n" + snap.tree_text[:200] + "\n\n")
+
+    return {
+        "last_snapshot": snap.tree_text,
+        "last_snapshot_taken": True,
+    }
 
 
 DECIDER_SYSTEM_PROMPT = """You control a browser. Propose exactly ONE tool call per turn.
@@ -233,8 +186,9 @@ RULE: Never describe what you will do next. If the goal isn't met yet, call a to
 
 RULE : In combobox or searchbox, Use type and submit tool, click is not required.
 
-If your last action was rejected, read the error and pick a different action. Do not repeat the same mistake."""
+RULE : Conversation history is just for overall context never pick ref number from it. Old ref are for old web pages ignore them. Use new ones from snapshot
 
+If your last action was rejected, read the error and pick a different action. Do not repeat the same mistake."""
 
 async def decider_node(state: BrowserAgentState) -> dict:
     """Pick exactly one next tool call, given goal + last snapshot + history.
@@ -266,10 +220,11 @@ async def decider_node(state: BrowserAgentState) -> dict:
             f"Re-check the snapshot before trying again — do not just retry blindly."
         )
 
-    print(f"\n\n Last action result: {state.get('last_action_result')}")
+    logger.info(f"Last action result: {state.get('last_action_result')}\n\n")
 
     messages = [
         SystemMessage(content=DECIDER_SYSTEM_PROMPT),
+        SystemMessage(content = "Conversational History : \n\n"),
         *state.get("messages", []),
         HumanMessage(content="\n\n".join(context_parts)),
     ]
@@ -280,7 +235,7 @@ async def decider_node(state: BrowserAgentState) -> dict:
     if not response.tool_calls:
         # Model didn't call a tool — treat as "done" signal via final_answer.
 
-        print(f"[decider] step={state.get('step_count')} -> NO TOOL CALL (treating as done). content={response.content[:100]!r}")
+        logger.info(f"[decider] step={state.get('step_count')} -> NO TOOL CALL (treating as done). content={response.content[:100]!r} \n\n")
         
         return {
             "messages": [response],
@@ -288,11 +243,11 @@ async def decider_node(state: BrowserAgentState) -> dict:
             "final_answer": response.content,
         }
 
-    call = response.tool_calls[0]  # enforce ONE action per turn, ignore extras
+    call = response.tool_calls[0]
     response.tool_calls = [call]
 
-    print(f"[decider] step={state.get('step_count')} -> {call['name']}({call['args']})"
-          + (f" | prior_error={state['ref_validation_error'][:80]!r}" if state.get('ref_validation_error') else ""))
+    logger.info(f"[decider] step={state.get('step_count')} -> {call['name']}({call['args']})"
+          + (f" | prior_error={state['ref_validation_error'][:80]!r}" if state.get('ref_validation_error') else "") + "\n\n")
 
 
     pending: dict = {
@@ -304,12 +259,49 @@ async def decider_node(state: BrowserAgentState) -> dict:
     return {
         "messages": [response],
         "pending_action": pending,
-        "ref_validation_error": None,  # clear previous error once a new attempt is made
+        "ref_validation_error": None,
     }
 
 
+ROLE_CHECK_PROMPT = """Snapshot:
+{snapshot}
+
+What is the accessibility role of the element with ref={ref}? 
+Respond with ONLY the role word (e.g. "link", "button", "searchbox", "combobox"). 
+If ref={ref} does not appear in the snapshot, respond with exactly: NOT_FOUND"""
+
+async def _parse_ref_roles(snapshot_text: str, ref : str) -> str | None:
+    """Ask the LLM what role a specific ref has in the snapshot.
+
+    Returns the role string (e.g. "link", "searchbox"), or None if the
+    ref wasn't found. Replaces the old regex-based _parse_ref_roles,
+    since real testing showed the snapshot format varies too much
+    across sites (unlabeled elements, wrapped multi-line labels) for a
+    single regex to reliably cover.
+    """
+
+    logger.info(f"Ref Parser function called {snapshot_text[:200]}\n\n")
+
+    model = ChatOllama(model=MODEL_ID, temperature=0)
+
+    messages = [
+        SystemMessage(content=ROLE_CHECK_PROMPT.format(snapshot=snapshot_text, ref=ref)),
+        HumanMessage(content=f"ref={ref}"),
+    ]
+
+    response = await model.ainvoke(messages)
+    role = response.content.strip()
+
+    logger.info(f"[ref_role_check] ref={ref!r} -> {role!r}\n\n")
+
+    if role == "NOT_FOUND" or not role:
+        return None
+    
+    return role
+
+
 async def ref_validator_node(state: BrowserAgentState) -> dict:
-    """Pure code, zero LLM calls. Checks the proposed ref's role against
+    """Checks the proposed ref's role against
     what the action actually needs, using the last real snapshot as
     ground truth. Also caps repeated validation failures so a stuck
     model can't loop here forever.
@@ -319,6 +311,7 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
     pending = state.get("pending_action")
 
     if not pending or not pending.get("ref"):
+        logger.info("Not pending tasks\n\n")
         return {"ref_validation_error": None, "ref_validation_count": 0}
 
     tool_name = pending["tool"]
@@ -326,6 +319,7 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
     expected_roles = EXPECTED_ROLES.get(tool_name)
 
     if not expected_roles:
+        logger.info(f"Tool not need ref {tool_name}\n\n")
         return {"ref_validation_error": None, "ref_validation_count": 0}
 
     actual_role = await _parse_ref_roles(state.get("last_snapshot", ""), state.get("pending_action", {}).get("ref"))
@@ -342,7 +336,7 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
             f"by role AND label, not proximity."
         )
     else:
-        # Valid ref -> reset the counter, let it through.
+        logger.info(f"Ref check passed no errors found\n\n")
         return {"ref_validation_error": None, "ref_validation_count": 0}
 
     new_count = validation_count + 1
@@ -352,16 +346,7 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
         # than another retry. pending_action=None + final_answer set
         # means should_continue will route to end_max_steps/end_completed
         # instead of back into this same failure loop.
-        #
-        # BUG FIX: also clear/neutralize last_action_result here. Without
-        # this, should_continue's check ("was the last action a failure?
-        # if so, refuse the completion claim") can see a STALE failed
-        # result from before these validation rejections and route back
-        # to decider_node anyway -- silently discarding final_answer and
-        # never actually stopping the loop. Setting success=True here
-        # means "we are choosing to stop on our own terms, not because
-        # the last real action failed" -- the actual failure reason is
-        # preserved in final_answer's text instead.
+        logger.info(f"Limit of ref validation count exceeded \n\n")
         return {
             "ref_validation_error": None,
             "ref_validation_count": 0,
@@ -373,6 +358,8 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
             ),
         }
     else :
+
+        logger.info(f"Current ref validation error {error} \n\n")
         return {
             "ref_validation_error": error,
             "ref_validation_count": new_count,
@@ -396,7 +383,7 @@ def end_message_node(state: BrowserAgentState) -> dict:
     else:
         reason = "completed"
 
-    print(f"[end_message_node] reason={reason} final_answer={state.get('final_answer')!r}")
+    logger.info(f"[end_message_node] reason={reason} final_answer={state.get('final_answer')!r}\n\n")
 
     return {
         "end_reason": reason,

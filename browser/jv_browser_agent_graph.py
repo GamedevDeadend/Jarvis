@@ -15,8 +15,8 @@ from pydantic import BaseModel, Field
 
 from langchain_ollama import ChatOllama
 
-from jv_browser_agent_state import BrowserAgentState, initial_state
-from jv_browser_agent_nodes import (
+from browser.jv_browser_agent_state import BrowserAgentState, initial_state
+from browser.jv_browser_agent_nodes import (
     initial_query_parse_node,
     initial_navigate_node,
     observer_node,
@@ -26,7 +26,10 @@ from jv_browser_agent_nodes import (
 
     MODEL_ID
 )
-from jv_browser_agent_tools import BROWSER_TOOLS, close_session
+from browser.jv_browser_agent_tools import BROWSER_TOOLS, close_session
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 # ---- Routing / conditional-edge functions ----
@@ -37,11 +40,13 @@ from jv_browser_agent_tools import BROWSER_TOOLS, close_session
 def route_after_validation(state: BrowserAgentState) -> str:
     """Conditional edge: did the ref pass validation?"""
 
-    print(f"\n\n Route after validation called with state: {state.get('pending_action')}")
+    logger.info(f"Route after validation called with pending action: {state.get('pending_action')} \n\n")
 
     if state.get("ref_validation_error"):
-        return "decider_node"  # bounce back with feedback, no LLM cost wasted on execution
-    
+        logger.info(f"Going to decider node with ref validation error : {state.get('ref_validation_error')} \n\n")
+        return "decider_node"  
+
+    logger.info("Going to tool node to execute tool \n\n")
     return "browser_tool_node"
 
 GOAL_CHECK_PROMPT = """Goal: {goal}
@@ -65,8 +70,19 @@ async def should_continue(state: BrowserAgentState) -> str:
        Based on lastsnapshot and goal, no. of steps take and max_steps.
     """
 
-    print(f"\n\n Should continue router called with state: {state.get('pending_action')}, "
-          f"{state.get('last_action_result')}, {state.get('step_count')}, {state.get('max_steps')}")
+
+    logger.info(f"Should continue router called with pending action: {state.get('pending_action')} \n\n")
+
+    step_count = state.get("step_count", 0)
+    max_steps = state.get("max_steps", 12)
+
+    if step_count >= max_steps:
+        logger.info("Max steps tried : directing to end_message_node \n\n")
+        return "end_message_node"  # max steps reached, end the run
+
+    if state.get("pending_action") is None and state.get("final_answer"):
+        logger.info("Decider self-reported done : directing to end_message_node \n\n")
+        return "end_message_node"
 
 
     messages = [ 
@@ -86,24 +102,19 @@ async def should_continue(state: BrowserAgentState) -> str:
 
     is_goal_completed = response.isGoalCompleted
 
-    print(f"\n\n Response at should continue {response} \n\n")
-
-    step_count = state.get("step_count", 0)
-    max_steps = state.get("max_steps", 12)
-
-    if step_count >= max_steps:
-        return "end_message_node"  # max steps reached, end the run
-
-
     if is_goal_completed:
+        logger.info("Goal is achieved : directing to end_message_node \n\n")
         return "end_message_node"
 
+    logger.info("Goal not achieved yet : directing to decider_node \n\n")
     return "decider_node"
 
 
 # ---- Graph assembly ----
 
 def build_browser_agent_graph():
+
+    logger.info("Intializing agent Graph \n\n")
 
     tool_node = ToolNode(BROWSER_TOOLS)
 
@@ -135,14 +146,12 @@ def build_browser_agent_graph():
     return graph.compile()
 
 
-async def main():
+async def main(): 
+    
     app = build_browser_agent_graph()
 
-    goal = "Go to duck duck go find the tallest mountain in the world, then search for that mountain's country on google and tell me its capital city."
-    state = initial_state(goal=goal, max_steps=12)  # start_url now auto-parsed
-
-    # try:
-    # finally:
+    goal = "Play Nandemoiya song of artist named Radwimp on youtube.com"
+    state = initial_state(goal=goal, max_steps=12)
 
     result = await app.ainvoke(state)
     print("--- Final result ---")
@@ -150,8 +159,18 @@ async def main():
     print(f"final_answer: {result.get('final_answer')}")
     print(f"step_count: {result.get('step_count')}")
     input("Press Enter to close the browser and exit...")
-    await close_session()  # ensure browser session is closed even if error occurs
+    await close_session()
+    return "Press Enter to close Session" # ensure browser session is closed even if error occurs
+
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler("jarvis.log", encoding="utf-8"),
+        ],
+    )
     asyncio.run(main())
