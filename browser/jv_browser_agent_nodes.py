@@ -3,7 +3,7 @@ LangGraph nodes for the Browser Agent's perceive-act-verify loop.
 
 Implements the diagram:
     Query -> Initial navigate -> Observer_Node (snapshot)
-          -> Decider_Node -> Ref_Validator_Node -> Browser_Tool_Node
+          -> Decider_Node -> Ref_Validator_Node -> (loop back to Observer_Node | Tools_node)
           -> Observer_Node -> Should_Continue -> (loop back to Decider | END)
 
 Design principles carried over from browser_tools.py and browser_agent_state.py:
@@ -16,19 +16,13 @@ Design principles carried over from browser_tools.py and browser_agent_state.py:
     last_action_result + step_count + max_steps and routes on code logic
     alone. No LLM judgment about "are we done" — that was the original
     self-reported-completion trust problem this whole design avoids.
-
-FIX (this version): ref_validator_node's 3-strike cap now also clears
-last_action_result when it force-exits. Without this, should_continue's
-"was the last action a failure?" check could see a STALE failed result
-from before the validation rejections and route back to decider_node
-anyway — silently discarding final_answer and never actually stopping
-the loop.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+from typing import Literal
 
 from langchain.messages import SystemMessage, HumanMessage
 
@@ -48,12 +42,29 @@ MODEL_ID = "qwen2.5:3b"
 # Which snapshot "role" each action tool requires. Used by Ref_Validator_Node
 # to catch mismatches like typing into a combobox instead of a searchbox.
 EXPECTED_ROLES = {
-    "browser_click": {"button", "link", "checkbox", "radio", "menuitem", "tab"},
-    "browser_type": {"searchbox", "textbox", "combobox"},
+    """
+    Expected roles for each tool.
+    These are the ARIA roles that the tool expects the ref to have in the snapshot.
+    """
+    "browser_click": {
+        "button", "link", "checkbox", "radio", "switch",
+        "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
+        "option", "treeitem", "gridcell", "cell", "columnheader", "rowheader",
+        "listitem",
+    },
+    "browser_type": {
+        "searchbox", "textbox", "combobox", "spinbutton", "slider",
+    },
 }
 
 
 class IntialParsingSchema(BaseModel) :
+    """ 
+        Schema representing the result of the initial parsing of the goal.
+        Args:
+            intial_url (str): The initial URL to navigate to.
+            goal_steps (str): The steps to reach the goal in the query.
+    """
     initial_url : str  = Field(description="Initial url which agent should navigate to start the process . Example https://www.youtube.com, https://www.wikipedia.org ")
     goal_steps : str = Field(description="""Steps to reach goal in query. Break Goal in steps. STEPS:
                                 1. <first step>
@@ -62,42 +73,71 @@ class IntialParsingSchema(BaseModel) :
                                 ...""")
 
 
-INITIAL_PARSING_SYSTEM_PROMPT = """Break the goal into two things: the starting website, and an ordered list of steps to reach the answer.
+INITIAL_PARSING_SYSTEM_PROMPT = """
+You are a browser-agent goal planner.
 
-Respond in EXACTLY this format, nothing else:
-URL: <the starting website URL>
-STEPS:
-1. <first step>
-2. <second step>
-...
+Convert the user's goal into:
+1. A starting URL.
+2. A minimal ordered list of actions using the available browser tools.
 
-Keep each step short and concrete — one action or one clear sub-goal per line. Do not include ref tokens or technical details; steps describe WHAT to do, not HOW to click.
+RULES:
+- Start every step with the appropriate tool name.
+- Describe the target/action semantically; never invent refs, selectors, or DOM details.
+- Use one tool operation per step.
+- For searches, use `browser_type` with submit=True in the same step.
+- Use `browser_click` to open/select a relevant result or control.
+- Use `browser_snapshot` to read information or verify a required state.
+- Use `browser_go_back` only when the goal requires going back.
+- Do not add unnecessary actions.
+- Do not assume an action succeeded just because the tool succeeded; verify state when required.
+- Use `browser_extract_content` to extract information from the page when needed.
+- If the goal is a single simple action, output exactly one step.
 
-Examples:
+SITE:
+- Explicit URL → use it.
+- Named/implied website → use that website.
+- Otherwise → https://www.google.com
 
-Goal: "Go to Wikipedia and search for 'Mongols'. Tell me the first sentence of the article."
+EXAMPLES:
+
+Goal: "Go to Wikipedia and search for 'Mongols'. Tell me the first sentence."
+
 URL: https://www.wikipedia.org
 STEPS:
-1. Search for "Mongols"
-2. Open the Mongols article
-3. Read and report the first sentence
+1. browser_type — enter "Mongols" in the search field and submit
+2. browser_click — open the "Mongols" article
+3. browser_snapshot — read the first sentence
+4. browser_extract_content — extract the first sentence
 
 Goal: "Play Sparkle from Your Name movie on YouTube."
+
 URL: https://www.youtube.com
 STEPS:
-1. Search for "Sparkle Your Name"
-2. Open the relevant video from the search results
-3. Confirm the video is playing
+1. browser_type — enter "Sparkle Your Name" in the search field and submit
+2. browser_click — open the relevant video
+3. browser_snapshot — verify the video is playing
+4. browser_extract_content — extract playback information
 
 Goal: "Go to https://duckduckgo.com and search for 'browsegrab'. Tell me the title of the first result."
+
 URL: https://duckduckgo.com
 STEPS:
-1. Search for "browsegrab"
-2. Read the first search result's title
-3. Report the title
+1. browser_type — enter "browsegrab" in the search field and submit
+2. browser_snapshot — read the first result's title
+3. browser_extract_content — extract the title
 
-If no specific site is implied, use: https://www.google.com
-If the goal is already a single simple action, output exactly one step."""
+Goal: "Go to Wikipedia."
+
+URL: https://www.wikipedia.org
+STEPS:
+1. browser_navigate — open Wikipedia
+
+OUTPUT:
+URL: <starting URL>
+STEPS:
+1. <tool_name> — <action>
+2. <tool_name> — <action>
+"""
 
 
 async def initial_query_parse_node(state: BrowserAgentState) -> dict:
@@ -163,12 +203,12 @@ async def observer_node(state: BrowserAgentState) -> dict:
 
     logger.info(f"Observer node called {state['pending_action']} \n\n")
 
+    await asyncio.sleep(3.0)
     session = await _get_session()
     snap = await session.snapshot()
 
-    await asyncio.sleep(1.5)
 
-    logger.info("Snapshot take \n\n" + snap.tree_text[:200] + "\n\n")
+    logger.info("Snapshot taken \n\n" + snap.tree_text[:600] + "\n\n")
 
     return {
         "last_snapshot": snap.tree_text,
@@ -178,13 +218,11 @@ async def observer_node(state: BrowserAgentState) -> dict:
 
 DECIDER_SYSTEM_PROMPT = """You control a browser. Propose exactly ONE tool call per turn.
 
-RULE: To type into a search box, textbox, or combobox — call browser_type directly. This items not required click action.
-
 RULE: Only use ref tokens (like "e11") copied exactly from the snapshot. Never guess.
 
 RULE: Never describe what you will do next. If the goal isn't met yet, call a tool now — don't just plan it.
 
-RULE : In combobox or searchbox, Use type and submit tool, click is not required.
+RULE : In combobox or searchbox, Use type and submit, click is not required.
 
 RULE : Conversation history is just for overall context never pick ref number from it. Old ref are for old web pages ignore them. Use new ones from snapshot
 
@@ -257,18 +295,49 @@ async def decider_node(state: BrowserAgentState) -> dict:
     }
 
     return {
+        "ref_validation_error" : None,
         "messages": [response],
         "pending_action": pending,
-        "ref_validation_error": None,
     }
 
 
-ROLE_CHECK_PROMPT = """Snapshot:
+class RefRoleSchema(BaseModel):
+    """
+    Schema representing the result of a ref role check.
+    """
+    role: Literal["alert", "alertdialog", "application", "article", "banner",
+    "blockquote", "button", "caption", "cell", "checkbox",
+    "code", "columnheader", "combobox", "complementary",
+    "contentinfo", "definition", "deletion", "dialog", "directory",
+    "document", "emphasis", "feed", "figure", "form", "generic",
+    "grid", "gridcell", "group", "heading", "img", "insertion",
+    "link", "list", "listbox", "listitem", "log", "main",
+    "marquee", "math", "meter", "menu", "menubar", "menuitem",
+    "menuitemcheckbox", "menuitemradio", "navigation", "none",
+    "note", "option", "paragraph", "presentation", "progressbar",
+    "radio", "radiogroup", "region", "row", "rowgroup", "rowheader",
+    "scrollbar", "search", "searchbox", "separator", "slider",
+    "spinbutton", "status", "strong", "subscript", "superscript",
+    "switch", "tab", "table", "tablist", "tabpanel", "term",
+    "textbox", "time", "timer", "toolbar", "tooltip", "tree",
+    "treegrid", "treeitem"] 
+
+
+ROLE_CHECK_PROMPT = """You are a strict accessibility-tree parser.
+Snapshot:
 {snapshot}
 
-What is the accessibility role of the element with ref={ref}? 
-Respond with ONLY the role word (e.g. "link", "button", "searchbox", "combobox"). 
-If ref={ref} does not appear in the snapshot, respond with exactly: NOT_FOUND"""
+Find the EXACT occurrence of [ref={ref}].
+
+Return the role explicitly written for that exact ref.
+
+Rules:
+1. Do NOT infer the role from surrounding elements.
+2. Do NOT infer the role from the element's label.
+3. Do NOT infer the role from what the element is likely to do.
+4. Copy the role exactly as represented in the snapshot.
+5. If [ref={ref}] does not occur anywhere in the snapshot, return NOT_FOUND.
+"""
 
 async def _parse_ref_roles(snapshot_text: str, ref : str) -> str | None:
     """Ask the LLM what role a specific ref has in the snapshot.
@@ -280,24 +349,24 @@ async def _parse_ref_roles(snapshot_text: str, ref : str) -> str | None:
     single regex to reliably cover.
     """
 
-    logger.info(f"Ref Parser function called {snapshot_text[:200]}\n\n")
-
-    model = ChatOllama(model=MODEL_ID, temperature=0)
+    logger.info(f"Ref Parser function called with snapshot {snapshot_text[:200]} and ref {ref}\n\n")
 
     messages = [
         SystemMessage(content=ROLE_CHECK_PROMPT.format(snapshot=snapshot_text, ref=ref)),
         HumanMessage(content=f"ref={ref}"),
     ]
 
-    response = await model.ainvoke(messages)
-    role = response.content.strip()
+    model = ChatOllama(model=MODEL_ID, temperature=0)
 
-    logger.info(f"[ref_role_check] ref={ref!r} -> {role!r}\n\n")
+    structured_llm = model.with_structured_output(RefRoleSchema)
+    response : RefRoleSchema = await structured_llm.ainvoke(messages)
 
-    if role == "NOT_FOUND" or not role:
+    logger.info(f"[ref_role_check] ref={ref!r} -> {response.role!r}\n\n")
+
+    if response.role == "NOT_FOUND" or not response.role:
         return None
     
-    return role
+    return response.role
 
 
 async def ref_validator_node(state: BrowserAgentState) -> dict:
@@ -342,20 +411,13 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
     new_count = validation_count + 1
 
     if new_count >= 3:
-        # Cap hit: stop looping here entirely, force a hard exit rather
-        # than another retry. pending_action=None + final_answer set
-        # means should_continue will route to end_max_steps/end_completed
-        # instead of back into this same failure loop.
         logger.info(f"Limit of ref validation count exceeded \n\n")
         return {
-            "ref_validation_error": None,
+            "ref_validation_error": "stale ref issue. New Snapshot is captured",
             "ref_validation_count": 0,
             "pending_action": None,
             "last_action_result": {"success": True, "error": None, "url": None},
-            "final_answer": (
-                f"Gave up after 3 consecutive invalid ref attempts on '{ref}'. "
-                f"Last error: {error}"
-            ),
+            "step_count": state.get("step_count", 0) + 1
         }
     else :
 
@@ -363,6 +425,7 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
         return {
             "ref_validation_error": error,
             "ref_validation_count": new_count,
+            "pending_action" : None
         }
         
 

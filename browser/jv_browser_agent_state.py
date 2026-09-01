@@ -66,5 +66,5 @@ def initial_state(
         ref_validation_count = 0,
         
         end_reason=None,
-        final_answer=None
+        final_answer=None,
     )

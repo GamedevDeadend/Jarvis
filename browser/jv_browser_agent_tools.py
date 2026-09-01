@@ -181,7 +181,7 @@ async def browser_click(ref: str, runtime: ToolRuntime) -> Command:
 
 
 @tool
-async def browser_type(ref: str, text: str, submit: bool = False, runtime: ToolRuntime = None) -> Command:
+async def browser_type(ref: str, text: str, submit: bool = True, runtime: ToolRuntime = None) -> Command:
     """ Type text into an input element on the page by its ref.
         To perform a search: ALWAYS set submit=True in the SAME call that types
         the search text. Do NOT type first and click a separate button afterward
