@@ -6,27 +6,32 @@ Implements the diagram:
           -> Decider_Node -> Ref_Validator_Node -> (loop back to Observer_Node | Tools_node)
           -> Observer_Node -> Should_Continue -> (loop back to Decider | END)
 
-Design principles carried over from browser_tools.py and browser_agent_state.py:
-  - Decider_Node picks exactly ONE next tool call. It does not execute
+  - Decider_Node :  picks exactly ONE next tool call. It does not execute
     anything and does not judge success/failure — single narrow job.
-  - Ref_Validator_Node is PURE CODE, no LLM call. It checks the proposed
+
+  - Ref_Validator_Node :  It checks the proposed
     ref's role (from the last snapshot) against what the action needs.
+
   - Should_Continue / Outcome_Router is one function (LangGraph
-    conditional edge), not two separate LLM nodes: it reads
-    last_action_result + step_count + max_steps and routes on code logic
-    alone. No LLM judgment about "are we done" — that was the original
-    self-reported-completion trust problem this whole design avoids.
+    conditional edge). it reads last_action_result + step_count + max_steps and routes on code logic
+    alone.
 """
 
 from __future__ import annotations
 
 import asyncio
-import re
+import base64
+import base64
+import os
+
 from typing import Literal
 
 from langchain.messages import SystemMessage, HumanMessage
 
 from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
+
+api_key = os.getenv("GROQ_API_KEY")
 
 from browser.jv_browser_agent_state import BrowserAgentState
 from browser.jv_browser_agent_tools import BROWSER_TOOLS, _get_session
@@ -37,7 +42,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+GROQ_MODEL_ID = "openai/gpt-oss-20b"
 MODEL_ID = "qwen2.5:3b"
+VL_MODEL_ID = "qwen3.5:0.8b"
 
 # Which snapshot "role" each action tool requires. Used by Ref_Validator_Node
 # to catch mismatches like typing into a combobox instead of a searchbox.
@@ -79,19 +86,6 @@ You are a browser-agent goal planner.
 Convert the user's goal into:
 1. A starting URL.
 2. A minimal ordered list of actions using the available browser tools.
-
-RULES:
-- Start every step with the appropriate tool name.
-- Describe the target/action semantically; never invent refs, selectors, or DOM details.
-- Use one tool operation per step.
-- For searches, use `browser_type` with submit=True in the same step.
-- Use `browser_click` to open/select a relevant result or control.
-- Use `browser_snapshot` to read information or verify a required state.
-- Use `browser_go_back` only when the goal requires going back.
-- Do not add unnecessary actions.
-- Do not assume an action succeeded just because the tool succeeded; verify state when required.
-- Use `browser_extract_content` to extract information from the page when needed.
-- If the goal is a single simple action, output exactly one step.
 
 SITE:
 - Explicit URL → use it.
@@ -159,13 +153,13 @@ async def initial_query_parse_node(state: BrowserAgentState) -> dict:
     response : IntialParsingSchema = await structured_llm.ainvoke(messages)
 
     url = response.initial_url
-    goal_lines = state["goal"] + "\n" + response.goal_steps
+    goal_lines = "\n" + response.goal_steps
 
     logger.info(f" Initial url : {url} \n\n")
-    logger.info(f"Steps for Goal : \n{goal_lines}\n\n")
+    logger.info(f"Steps for {state.get('goal')} : \n{goal_lines}\n\n")
 
 
-    return {"_start_url" : url, "goal" : goal_lines}
+    return {"_start_url" : url, "goal_steps" : goal_lines}
 
 
 
@@ -208,7 +202,7 @@ async def observer_node(state: BrowserAgentState) -> dict:
     snap = await session.snapshot()
 
 
-    logger.info("Snapshot taken \n\n" + snap.tree_text[:600] + "\n\n")
+    logger.info("Snapshot taken \n\n" + snap.tree_text[:2000] + "\n\n")
 
     return {
         "last_snapshot": snap.tree_text,
@@ -242,6 +236,7 @@ async def decider_node(state: BrowserAgentState) -> dict:
     model_with_tools = model.bind_tools(BROWSER_TOOLS)
 
     context_parts = [f"GOAL: {state['goal']}"]
+    context_parts.append(f"GOAL STEPS: {state.get('goal_steps', '')}")
 
     if state.get("last_snapshot"):
         context_parts.append(f"MOST RECENT SNAPSHOT:\n{state['last_snapshot']}")
@@ -427,8 +422,134 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
             "ref_validation_count": new_count,
             "pending_action" : None
         }
-        
 
+GOAL_CHECK_PROMPT = """
+You are a goal-checker. Compare the GOAL to the SCREENSHOT_DESCRIPTION and decide if the goal was achieved.
+
+RULES:
+1. If the SCREENSHOT_DESCRIPTION indicates an advertisement is currently playing or displayed (sponsored content, promotional material,
+    or any content visibly distinct from and unrelated to the GOAL),do not judge the goal by the ad itself.
+    Instead, look for evidence of the underlying content the user actually requested
+   (its title, name, or identifying details).
+
+1. PLAY/OPEN a song or video → Achieved if the video/song is shown loaded or playing in a main player (not just listed in search results or a queue/sidebar).
+2. SEARCH a topic → Achieved if relevant search results are shown OR an article/page is opened.
+3. ORDER a product → Achieved if product is added to cart. Payment/checkout pages do NOT count.
+4. If none of the above patterns fit, use your best judgment based on whether the description shows the end-state of the goal.
+
+Only use the SCREENSHOT_DESCRIPTION as evidence. Do not assume steps happened that aren't described.
+
+Goal:
+\"\"\" 
+{goal}
+\"\"\"
+
+Screenshot Description:
+\"\"\"
+ {screenshot_description}.
+\"\"\"
+
+"""
+
+
+
+class GoalCheckSchema(BaseModel):
+    """
+    Schema representing the result of a goal completion check.
+
+    Args:
+        isGoalCompleted (bool): Indicates whether the goal has been successfully achieved. 
+        goal_chck_msg (str): Message describing whether the goal was achieved or not.
+    """
+    is_goal_completed : bool = Field(description = "Boolean which shows if goal is achieved or not")
+    goal_chck_msg : str = Field(description = "String msg to show if goal is achieved or not")
+
+
+async def goal_check_node(state: BrowserAgentState) -> str:
+    """
+    Checks if the goal has been achieved based on the Screenshot.
+    """
+
+    step_count = state.get("step_count", 0)
+    max_steps = state.get("max_steps", 12)
+
+    if step_count >= max_steps:
+        logger.info("Max steps tried : No need to take Screenshot \n\n")
+        return {}
+
+    if state.get("ref_validation_error"):
+        logger.info("Recovery cycle (validation failed) : skipping Screenshot \n\n")
+        return {}
+
+
+
+    try : 
+        session  = await _get_session()
+
+    except Exception as e:
+
+        logger.error(f"Error while getting session : {e} \n\n")
+        return {}
+
+    session_page = await session._ensure_page()
+    page_screenshot_bytes = await session_page.screenshot()
+    
+    image_b64 = base64.b64encode(page_screenshot_bytes).decode("utf-8")
+    logger.info(f"Screenshot is being taken for goal check : \n\n")
+    
+    messages_ss = [
+        SystemMessage(
+            content = (
+                "You are a screenshot describer. You provide a detailed visual "
+                "description of the given image, so that it can be used to check "
+                "whether the user's goal has been achieved or not."
+            )
+        ),
+
+        HumanMessage(
+            content= [
+                {"type": "text", "text": "Describe the screenshot in detail. Focus on the visual elements, layout, and any text present."},
+
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                }
+            ]
+        )
+    ]
+
+    
+    vllm = ChatOllama(model = VL_MODEL_ID, temperature = 0, max_tokens = 200)
+    response_ss = await vllm.ainvoke(messages_ss)
+
+    logger.info(f"Screenshot description : {response_ss.content} \n\n")
+
+    
+    prompt_with_context = GOAL_CHECK_PROMPT.format(
+            goal=state.get("goal", "No goal found in state"),
+            screenshot_description= response_ss.content
+        )
+
+    
+        
+    llm = ChatGroq(model=GROQ_MODEL_ID, temperature=0, max_tokens=1024, api_key=api_key)
+    # llm = ChatOllama(model=MODEL_ID, temperature=0, max_tokens=1024)
+    structured_llm = llm.with_structured_output(GoalCheckSchema)
+    response : GoalCheckSchema = await structured_llm.ainvoke(prompt_with_context)
+
+    if(response.is_goal_completed):
+
+        logger.info(f"Goal is achieved based on screenshot : {response.goal_chck_msg} \n\n")
+        return {
+            "is_goal_reached" : response.is_goal_completed,
+            "final_answer" : response.goal_chck_msg
+        }
+    
+    else:
+        logger.info(f"Goal is NOT achieved based on screenshot : {response.goal_chck_msg} \n\n")
+    
+
+    
 def end_message_node(state: BrowserAgentState) -> dict:
     """Sets the final end_reason and final_answer once the loop is done.
 
