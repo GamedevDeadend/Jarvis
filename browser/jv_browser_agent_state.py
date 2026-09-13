@@ -21,6 +21,7 @@ class BrowserAgentState(TypedDict):
     messages: Annotated[Sequence[AnyMessage], add_messages]
 
     goal: str
+    goal_steps: str
     max_steps: int
     _start_url: str
 
@@ -36,6 +37,7 @@ class BrowserAgentState(TypedDict):
     end_reason: Literal["completed", "gave_up", "max_steps_reached"] | None
     final_answer: str | None
     ref_validation_count: int
+    is_goal_reached : bool
 
 
 def initial_state(
@@ -52,6 +54,7 @@ def initial_state(
 
         _start_url=start_url,
         goal=goal,
+        goal_steps="",
 
         step_count=0,
         max_steps=max_steps,
@@ -67,4 +70,5 @@ def initial_state(
         
         end_reason=None,
         final_answer=None,
+        is_goal_reached = False
     )

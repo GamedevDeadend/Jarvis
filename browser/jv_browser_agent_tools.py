@@ -21,14 +21,69 @@ from langchain.messages import ToolMessage
 from langgraph.types import Command
 
 from browsegrab import BrowseSession
+from browsegrab.browser.manager import BrowserManager
 from browsegrab.config import BrowseGrabConfig
+
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+
+import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
+browser_profile_path = os.getenv("BROWSER_PROFILE_PATH")
+browser_executable_path = os.getenv("BROWSER_EXECUTABLE_PATH")
 
 
 config = BrowseGrabConfig()
 config.browser.headless = False
 
-
 session = None
+
+
+def overriding_browser_manager_class() : 
+    """
+    Overriding default methods of BrowserMangerClass
+    to make it compatible with Lauch_Persistent_Context (Browser launch with Saved profiels)
+    """
+
+
+    async def _ensure_browser(self)->Browser : 
+        """Lazily launch browser on first use."""
+
+        if self._browser is None:
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
+
+            self._browser = await self._playwright.chromium.launch_persistent_context(user_data_dir=browser_profile_path, executable_path=browser_executable_path, headless=config.browser.headless, args=["--profile-directory=Profile 2"] )
+
+        return self._browser
+
+    async def new_context(self, **kw):
+        return await self._ensure_browser()
+
+    async def new_page(self, **kw):
+        context = await self.new_context()
+        page = await context.new_page()
+        page.set_default_timeout(self.config.timeout_ms)
+
+        return page
+
+    async def close(self):
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright:
+            await self._playwright.stop()
+            self._playwright = None
+
+    BrowserManager._ensure_browser = _ensure_browser
+    BrowserManager.new_context = new_context
+    BrowserManager.new_page = new_page
+    BrowserManager.close = close
+
+
+overriding_browser_manager_class()
 
 
 async def _get_session() -> BrowseSession:
@@ -37,6 +92,7 @@ async def _get_session() -> BrowseSession:
     if session is None:
         session = BrowseSession(config=config)
         await session.__aenter__()
+
     return session
 
 
