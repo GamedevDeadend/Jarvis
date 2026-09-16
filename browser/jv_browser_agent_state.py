@@ -34,6 +34,11 @@ class BrowserAgentState(TypedDict):
     last_action_result: dict | None
     step_count: int
 
+    human_feedback_query : str | None
+    human_feedback_caller : str | None
+    human_feedback : str | None
+
+
     end_reason: Literal["completed", "gave_up", "max_steps_reached"] | None
     final_answer: str | None
     ref_validation_count: int
@@ -67,6 +72,10 @@ def initial_state(
 
         ref_validation_error=None,
         ref_validation_count = 0,
+
+        human_feedback_query = "",
+        human_feedback_caller = "",
+        human_feedback = "",
         
         end_reason=None,
         final_answer=None,

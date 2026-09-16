@@ -5,16 +5,12 @@ State based Graph assembly for the Browser Agent's perceive-act-verify loop.
 from __future__ import annotations
 
 import asyncio
-import base64
-from typing import TypedDict
+import uuid
 
-from langchain.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, START
 from langgraph.prebuilt import ToolNode
-from pydantic import BaseModel, Field
-
-from langchain_ollama import ChatOllama
 
 from browser.jv_browser_agent_state import BrowserAgentState, initial_state
 from browser.jv_browser_agent_nodes import (
@@ -25,10 +21,10 @@ from browser.jv_browser_agent_nodes import (
     decider_node,
     ref_validator_node,
     end_message_node,
-
-    MODEL_ID
+    human_feedback_node,
 )
 from browser.jv_browser_agent_tools import BROWSER_TOOLS, close_session
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -39,10 +35,17 @@ langfuse_handler = CallbackHandler()
 import logging
 logger = logging.getLogger(__name__)
 
-VL_MODEL_ID = "qwen3.5:0.8b"
 
 
-
+async def process_hf_interrupts(app, config, result):
+    """ 
+    Function to process interrupts raised for Human feed back by Browser Agent
+    """
+    while result.get("__interrupt__"):
+        agent_query = result["__interrupt__"][0].value
+        answer = input( f"{agent_query}\n\n" )
+        result = await app.ainvoke(Command(resume=answer), config)
+    return result
 
 
 def route_after_validation(state: BrowserAgentState) -> str:
@@ -60,7 +63,6 @@ def route_after_validation(state: BrowserAgentState) -> str:
 
     logger.info("Going to tool node to execute tool \n\n")
     return "browser_tool_node"
-
 
 
 async def should_continue(state: BrowserAgentState) -> str:
@@ -103,18 +105,19 @@ def build_browser_agent_graph():
 
     graph = StateGraph(BrowserAgentState)
 
-    graph.add_node("initial_query_parse", initial_query_parse_node)
-    graph.add_node("initial_navigate", initial_navigate_node)
+    graph.add_node("initial_query_parse_node", initial_query_parse_node)
+    graph.add_node("initial_navigate_node", initial_navigate_node)
     graph.add_node("observer_node", observer_node)
     graph.add_node("goal_check_node", goal_check_node)
     graph.add_node("decider_node", decider_node)
     graph.add_node("ref_validator_node", ref_validator_node)
     graph.add_node("browser_tool_node", tool_node)
     graph.add_node("end_message_node", end_message_node)
+    graph.add_node("human_feedback_node", human_feedback_node)
 
-    graph.add_edge(START, "initial_query_parse")
-    graph.add_edge("initial_query_parse", "initial_navigate")
-    graph.add_edge("initial_navigate", "observer_node")
+    graph.add_edge(START, "initial_query_parse_node")
+    graph.add_edge("initial_query_parse_node", "initial_navigate_node")
+    graph.add_edge("initial_navigate_node", "observer_node")
     graph.add_edge("observer_node", "goal_check_node")
     graph.add_edge("decider_node", "ref_validator_node")
     graph.add_edge("browser_tool_node", "observer_node")
@@ -123,23 +126,28 @@ def build_browser_agent_graph():
     graph.add_conditional_edges("goal_check_node", should_continue)
 
 
-    return graph.compile()
+    return graph.compile(checkpointer=InMemorySaver())
 
 
 async def main(): 
     
     app = build_browser_agent_graph()
 
-    goal = "ORDER Fabelle choclate from amazon.in"
+    goal = "Order Zoro poster on Amazon"
     state = initial_state(goal=goal, max_steps=12)
 
-    result = await app.ainvoke(
-        state,
-        config = {
+    config = {
+            "configurable": {"thread_id": {str(uuid.uuid4())}},
             "callbacks": [langfuse_handler],
             "run_name" : f"goal: {goal}",
         }
-    )
+
+    result = await app.ainvoke(state, config)
+
+    print(f"\n\n {result} \n\n")
+
+    result = await process_hf_interrupts(app, config, result)
+
     print("--- Final result ---")
     print(f"end_reason: {result.get('end_reason')}")
     print(f"final_answer: {result.get('final_answer')}")
@@ -150,7 +158,6 @@ async def main():
 
     input("Press Enter to close the browser and exit...")
     await close_session()
-
 
 
 if __name__ == "__main__":

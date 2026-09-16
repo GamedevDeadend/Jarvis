@@ -25,6 +25,7 @@ import base64
 import os
 
 from typing import Literal
+from langgraph.types import interrupt, Command
 
 from langchain.messages import SystemMessage, HumanMessage
 
@@ -134,7 +135,7 @@ STEPS:
 """
 
 
-async def initial_query_parse_node(state: BrowserAgentState) -> dict:
+async def initial_query_parse_node(state: BrowserAgentState) -> dict | Command[Literal["human_feedback_node"]]:
     """
     Runs once, before initial_navigate_node. Uses a cheap LLM call to
     extract which site the goal implies AND break the goal into ordered
@@ -158,8 +159,7 @@ async def initial_query_parse_node(state: BrowserAgentState) -> dict:
     logger.info(f" Initial url : {url} \n\n")
     logger.info(f"Steps for {state.get('goal')} : \n{goal_lines}\n\n")
 
-
-    return {"_start_url" : url, "goal_steps" : goal_lines}
+    return {"_start_url" : url, "goal_steps" : goal_lines, "human_feedback" : None}
 
 
 
@@ -210,7 +210,9 @@ async def observer_node(state: BrowserAgentState) -> dict:
     }
 
 
-DECIDER_SYSTEM_PROMPT = """You control a browser. Propose exactly ONE tool call per turn.
+DECIDER_SYSTEM_PROMPT = """You are deicder node part of browser automation system. Based on page snapashot and other details, you will decide what next tool call to perform.
+
+Propose exactly ONE tool call per turn.
 
 RULE: Only use ref tokens (like "e11") copied exactly from the snapshot. Never guess.
 
@@ -319,8 +321,8 @@ class RefRoleSchema(BaseModel):
 
 
 ROLE_CHECK_PROMPT = """You are a strict accessibility-tree parser.
-Snapshot:
-{snapshot}
+Snapshot_Line:
+{snapshot_line}
 
 Find the EXACT occurrence of [ref={ref}].
 
@@ -344,10 +346,12 @@ async def _parse_ref_roles(snapshot_text: str, ref : str) -> str | None:
     single regex to reliably cover.
     """
 
-    logger.info(f"Ref Parser function called with snapshot {snapshot_text[:200]} and ref {ref}\n\n")
+    ref_line = next((line for line in snapshot_text.splitlines() if ref in line), None)
+
+    logger.info(f"Ref Parser function called with snapshot {snapshot_text[:200]} and line is {ref_line}\n\n")
 
     messages = [
-        SystemMessage(content=ROLE_CHECK_PROMPT.format(snapshot=snapshot_text, ref=ref)),
+        SystemMessage(content=ROLE_CHECK_PROMPT.format(snapshot_line=ref_line, ref=ref)),
         HumanMessage(content=f"ref={ref}"),
     ]
 
@@ -573,3 +577,24 @@ def end_message_node(state: BrowserAgentState) -> dict:
         "end_reason": reason,
         "final_answer": state.get("final_answer") or "Task ended without a final answer.",
     }
+
+def human_feedback_node(state : BrowserAgentState) -> Command :
+    """
+    General Human feedback node this can be called by any node
+    to take human input to reduce or avoid hallucinating.
+    It doesn't require any edge connection it is called using Command()
+    """
+
+    caller_node = state.get("human_feedback_caller")
+    feedback_query = state.get("human_feedback_query")
+
+    logger.info(f"Calling now HIL Flow from {caller_node}")
+
+    human_response = interrupt(
+        f"{caller_node} node need your input on this :\n{feedback_query}"
+    ) 
+
+    return Command(
+        goto = caller_node,
+        update={"human_feedback_query" : None, "human_feedback_caller" : None, "human_feedback" : human_response}
+    )
