@@ -18,12 +18,14 @@ from browser.jv_browser_agent_nodes import (
     initial_query_parse_node,
     initial_navigate_node,
     observer_node,
+    snapshot_optimizer_node,
+    plan_reviewer_node,
     decider_node,
     ref_validator_node,
     end_message_node,
     human_feedback_node,
 )
-from browser.jv_browser_agent_tools import BROWSER_TOOLS, close_session
+from browser.jv_browser_agent_tools import BROWSER_TOOLS, close_browser
 
 
 from dotenv import load_dotenv
@@ -108,6 +110,8 @@ def build_browser_agent_graph():
     graph.add_node("initial_query_parse_node", initial_query_parse_node)
     graph.add_node("initial_navigate_node", initial_navigate_node)
     graph.add_node("observer_node", observer_node)
+    graph.add_node("snapshot_optimizer_node", snapshot_optimizer_node)
+    graph.add_node("plan_reviewer_node", plan_reviewer_node)
     graph.add_node("goal_check_node", goal_check_node)
     graph.add_node("decider_node", decider_node)
     graph.add_node("ref_validator_node", ref_validator_node)
@@ -118,7 +122,9 @@ def build_browser_agent_graph():
     graph.add_edge(START, "initial_query_parse_node")
     graph.add_edge("initial_query_parse_node", "initial_navigate_node")
     graph.add_edge("initial_navigate_node", "observer_node")
-    graph.add_edge("observer_node", "goal_check_node")
+    graph.add_edge( "observer_node", "snapshot_optimizer_node",)
+    graph.add_edge( "snapshot_optimizer_node","plan_reviewer_node")
+    graph.add_edge("plan_reviewer_node", "goal_check_node")
     graph.add_edge("decider_node", "ref_validator_node")
     graph.add_edge("browser_tool_node", "observer_node")
 
@@ -133,7 +139,8 @@ async def main():
     
     app = build_browser_agent_graph()
 
-    goal = "Order Zoro poster on Amazon"
+    # goal = "Order Zoro poster on Amazon"
+    goal = "Play Sparkle song by artist radwimps on youtube"
     state = initial_state(goal=goal, max_steps=12)
 
     config = {
@@ -157,7 +164,7 @@ async def main():
     print (result.get('messages'))
 
     input("Press Enter to close the browser and exit...")
-    await close_session()
+    await close_browser()
 
 
 if __name__ == "__main__":

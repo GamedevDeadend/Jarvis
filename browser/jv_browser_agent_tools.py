@@ -1,14 +1,8 @@
 """
 Raw browser tools for the Jarvis Browser Agent.
 
-Wraps browsegrab's Python API directly (not via its MCP server) so we get
-full code-level control — specifically, the ability to enforce the
-"never trust the model's self-reported done" rule from outside the LLM.
-
-I deliberately use ONLY this manual-control API, never session.browse(...).
-session.browse() is browsegrab's own built-in agentic loop — it has its own
-LLM call and its own "done" self-termination, which is exactly the
-unverified-completion problem we're trying to solve.
+It is mix of custom tools(Using Playwright API) and some optimization functions
+to optimise snapshot.
 
 This is an ASYNC API. Tools below use LangChain's async `@tool` support
 (coroutine functions) accordingly — not sync wrappers.
@@ -16,95 +10,261 @@ This is an ASYNC API. Tools below use LangChain's async `@tool` support
 
 from __future__ import annotations
 
+import os
+import re
+import asyncio
+
+
 from langchain.tools import tool, ToolRuntime
 from langchain.messages import ToolMessage
 from langgraph.types import Command
 
-from browsegrab import BrowseSession
-from browsegrab.browser.manager import BrowserManager
-from browsegrab.config import BrowseGrabConfig
+from playwright.async_api import BrowserContext, Response, Page, Locator, async_playwright, Playwright
 
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
-
-import os
 
 from dotenv import load_dotenv
 load_dotenv()
+
+import logging
+logger = logging.getLogger(__name__)
 
 browser_profile_path = os.getenv("BROWSER_PROFILE_PATH")
 browser_executable_path = os.getenv("BROWSER_EXECUTABLE_PATH")
 
 
-config = BrowseGrabConfig()
-config.browser.headless = False
+# config = BrowseGrabConfig()
+# config.snapshot.filter_interactive_only = True
+# # config.snapshot.max_snapshot_length = 3000
+# # config.snapshot.max_content_length = 1000
+# config.browser.headless = False
 
-session = None
+browser = None
+playwright = None
+
+REF_LOOKUP = {}
+
+VALID_ROLES = {
+    "alert",
+    "alertdialog",
+    "application",
+    "article",
+    "banner",
+    "blockquote",
+    "button",
+    "caption",
+    "cell",
+    "checkbox",
+    "code",
+    "columnheader",
+    "combobox",
+    "complementary",
+    "contentinfo",
+    "definition",
+    "deletion",
+    "dialog",
+    "directory",
+    "document",
+    "emphasis",
+    "feed",
+    "figure",
+    "form",
+    "generic",
+    "grid",
+    "gridcell",
+    "group",
+    "heading",
+    "img",
+    "insertion",
+    "link",
+    "list",
+    "listbox",
+    "listitem",
+    "log",
+    "main",
+    "marquee",
+    "math",
+    "meter",
+    "menu",
+    "menubar",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "navigation",
+    "none",
+    "note",
+    "option",
+    "paragraph",
+    "presentation",
+    "progressbar",
+    "radio",
+    "radiogroup",
+    "region",
+    "row",
+    "rowgroup",
+    "rowheader",
+    "scrollbar",
+    "search",
+    "searchbox",
+    "separator",
+    "slider",
+    "spinbutton",
+    "status",
+    "strong",
+    "subscript",
+    "superscript",
+    "switch",
+    "tab",
+    "table",
+    "tablist",
+    "tabpanel",
+    "term",
+    "textbox",
+    "time",
+    "timer",
+    "toolbar",
+    "tooltip",
+    "tree",
+    "treegrid",
+    "treeitem",
+}
 
 
-def overriding_browser_manager_class() : 
+async def _get_browser()->BrowserContext:
+    """ Lazily load and return browser"""
+
+    global playwright,browser
+
+    if browser is None:
+        
+        playwright = await async_playwright().start()
+        chromium =  playwright.chromium
+        browser = await chromium.launch_persistent_context(user_data_dir=browser_profile_path, executable_path=browser_executable_path, headless=False, args=["--profile-directory=Profile 2"] )
+        page = await browser.new_page()
+            
+    return browser
+
+
+async def _get_page()->Page:
     """
-    Overriding default methods of BrowserMangerClass
-    to make it compatible with Lauch_Persistent_Context (Browser launch with Saved profiels)
+    Get Current page of browser
     """
 
+    browser = await _get_browser()
 
-    async def _ensure_browser(self)->Browser : 
-        """Lazily launch browser on first use."""
+    if browser.pages:
+        return browser.pages[-1]
 
-        if self._browser is None:
-            if self._playwright is None:
-                self._playwright = await async_playwright().start()
+    logger.info("No page is currently open")
+    return None
 
-            self._browser = await self._playwright.chromium.launch_persistent_context(user_data_dir=browser_profile_path, executable_path=browser_executable_path, headless=config.browser.headless, args=["--profile-directory=Profile 2"] )
-
-        return self._browser
-
-    async def new_context(self, **kw):
-        return await self._ensure_browser()
-
-    async def new_page(self, **kw):
-        context = await self.new_context()
-        page = await context.new_page()
-        page.set_default_timeout(self.config.timeout_ms)
-
-        return page
-
-    async def close(self):
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
-
-    BrowserManager._ensure_browser = _ensure_browser
-    BrowserManager.new_context = new_context
-    BrowserManager.new_page = new_page
-    BrowserManager.close = close
+async def _wait_for_load():
+    """
+    Helper function to wait for page loading
+    """
+    page  = await _get_page()
+    await page.wait_for_load_state("load")
 
 
-overriding_browser_manager_class()
+async def _get_locator(ref_id : str):
+    """
+    Get locator using ref id from Ref_Lookup
+    """
+    
+    if not REF_LOOKUP:
+        
+        logging.info("Ref lookup invalid \n\n")
+        return None
+    
+    role = REF_LOOKUP[ref_id]["role"]
+    name = REF_LOOKUP[ref_id]["name"]
+
+    page = await _get_page()
+    locator = page.get_by_role(role=role, name=name)
+
+    return locator
+
+    
+def ref_map_builder(snapshot : str):
+    """
+    Function to build Reference Lookup Dict
+    """
+
+    lines = snapshot.splitlines()
+
+    for line in lines:
+
+        # Search refs 
+        ref_match = re.search(r"\[ref=([^\]]+)\]", line)
+
+        if not ref_match:
+            continue
+
+        ref_id = ref_match.group(1)
+
+        # Pattern to lookup role of refs
+        REF_LOOKUP[ref_id] = {"role" : "", "name" : ""}
+
+        role_match_group = re.search(r"^\s*-\s*([a-z]+)", line)
+
+        if not role_match_group:
+            del REF_LOOKUP[ref_id]
+            continue
+
+        role = role_match_group.group(1)
+
+        if role not in VALID_ROLES:
+            del REF_LOOKUP[ref_id]
+            continue
+
+        # name / heading of refs
+        name_match = re.search(r'"(.+)"', line)
+
+        if not name_match:
+            del REF_LOOKUP[ref_id]
+            continue
+
+        name = name_match.group(1)
+        
+        REF_LOOKUP[ref_id] = {"role" : role, "name" : name}
 
 
-async def _get_session() -> BrowseSession:
-    """Lazily open the browsegrab session. One per agent run."""
-    global session
-    if session is None:
-        session = BrowseSession(config=config)
-        await session.__aenter__()
+async def optimised_snapshot():
 
-    return session
+    REF_LOOKUP.clear()
+
+    snapshot = ""
+
+    page = await _get_page()
+
+    if page is None :
+        return "No Page Found"
+        
+    snapshot = await page.locator("body").aria_snapshot(mode="ai")
+            
+
+    snapshot = re.sub( r"\s*\[cursor=[^\]]*\]", "",snapshot) #Removing [cursor=...]
+    snapshot = re.sub(r"(?m)^[\t\s]*-[\s]*\/url.*\n?\r?", "", snapshot) #Removing [urls]
+    snapshot = re.sub(r"(?m)^[\t\s]*-\s*(generic|listitem).+\n?\r?", "", snapshot) #Removing [generic, listitem]
+
+    ref_map_builder(snapshot)
+
+    return snapshot
 
 
-async def close_session() -> None:
-    """Explicitly close the shared session. Call this when the Browser
+async def close_browser() -> None:
+    """Explicitly close the browser. Call this when the Browser
     agent's task graph finishes (success, failure, or max-steps cutoff) —
     otherwise the browser process is left running.
     """
-    global session
-    if session is not None:
-        await session.close()
-        session = None
+    browser = _get_browser()
+
+    if browser is not None:
+        await browser.close()
+        browser = None
+        
+    if playwright is not None:
+        await playwright.stop()
+        playwright = None
 
 
 @tool
@@ -114,60 +274,63 @@ async def browser_navigate(runtime: ToolRuntime, url: str) -> Command:
     Args:
         url: Full URL to navigate to, including https://
     """
-    session = await _get_session()
-    result = await session.navigate(url)
-    success = getattr(result, "success", True)
-    error = getattr(result, "error", None)
 
-    step_count = runtime.state.get("step_count", 0) + 1
+    response = None
+    page = _get_page()
 
-    if not success:
-        return Command(
-            update={
-                "last_snapshot_taken": False,
-                "last_action_result": {"success": False, "error": error, "url": None},
-                "step_count": step_count,
-                "messages": [
-                    ToolMessage(
-                        content=f"Navigation to {url} FAILED: {error or 'unknown error'}",
-                        tool_call_id=runtime.tool_call_id,
+    try :
+
+        response = await page.goto(url)
+        await page.wait_for_load_state("load")
+        success = True
+
+    except Exception as e:
+
+        return Command(update={
+            "last_snapshot_taken": False,
+            "last_action_result": {"success": getattr(response, "ok", False), "error": str(e), "url": None},
+            "step_count": step_count,
+            "messages": [
+                ToolMessage(
+                    content=f"Navigation to {url} FAILED: {error or 'unknown error'}",
+                    tool_call_id=runtime.tool_call_id,
                     )
-                ],
+                ]
             }
-        )
-
+                       )
+    
+    success = getattr(response, "ok", True)
+    error  = None
+    step_count = runtime.state.get("step_count", 0) + 1
+    
     return Command(
         update={
             "last_snapshot_taken": False,
-            "last_action_result": {"success": True, "error": None, "url": url},
+            "last_action_result": {"success": success, "error": None, "url": url},
             "step_count": step_count,
             "messages": [
                 ToolMessage(
                     content=f"Navigated to {url}. Call browser_snapshot to see the page state.",
                     tool_call_id=runtime.tool_call_id,
-                )
-            ],
-        }
-    )
+                    )
+                ],
+            }
+        )
 
 
 @tool
 async def browser_snapshot(runtime: ToolRuntime) -> Command:
     """Take a snapshot of the current page's accessibility tree.
 
-    Returns a compact, ref-based (e1, e2, ...) representation of visible
+    Also creates a compact, ref-based (e1, e2, ...) representation of visible
     interactive elements and content, optimized for small local LLMs.
-    Each element is shown with its ref token in brackets, e.g.:
-        searchbox "Search Wikipedia" [ref=e11]
-        button "Search" [ref=e90]
 
     This is the ONLY source of truth for what is actually on the page.
     Always call this after an action to verify what happened — never
     assume an action succeeded without checking.
     """
-    session = await _get_session()
-    snap = await session.snapshot()
-    snapshot_text = snap.tree_text
+
+    snapshot_text = await optimised_snapshot()
 
     step_count = runtime.state.get("step_count", 0) + 1
 
@@ -193,16 +356,37 @@ async def browser_click(ref: str, runtime: ToolRuntime) -> Command:
     Args:
         ref: The ref TOKEN from the most recent browser_snapshot output
     """
-    session = await _get_session()
-    result = await session.click(ref)
-    success = getattr(result, "success", True)
-    error = getattr(result, "error", None)
-    url = getattr(result, "url", None)
+    
+    locator = await _get_locator(ref)
+    result=success=error=url= None
 
+    if locator is None:
+        return Command(
+            update={
+                "last_snapshot_taken": False,
+                "last_action_result": {"success": False, "error": "Locator not found, ref can't be resolved", "url": None},
+                "step_count": runtime.state.get("step_count", 0) + 1,
+                "messages": [ToolMessage(
+                    content="Click FAILED: ref not found or not clickable. Call browser_snapshot to see current valid refs.",
+                    tool_call_id=runtime.tool_call_id,)],
+            }
+        )
+
+
+    try :
+        result = await locator.click(timeout=10_000)
+        success = True
+    except Exception as e:
+        success = False
+        error = str(e)
+
+    print(f"\n\nClick result {result} \n")
+
+    page = await _get_page()
+    url = page.url if success else None
     step_count = runtime.state.get("step_count", 0) + 1
 
     if not success:
-        # Honest failure report — do NOT claim the click happened.
         return Command(
             update={
                 "last_snapshot_taken": False,
@@ -237,7 +421,7 @@ async def browser_click(ref: str, runtime: ToolRuntime) -> Command:
 
 
 @tool
-async def browser_type(ref: str, text: str, submit: bool = True, runtime: ToolRuntime = None) -> Command:
+async def browser_type(ref: str, text: str, submit: bool = True, clear: bool = True, runtime: ToolRuntime = None) -> Command:
     """ Type text into an input element on the page by its ref.
         To perform a search: ALWAYS set submit=True in the SAME call that types
         the search text. Do NOT type first and click a separate button afterward
@@ -246,17 +430,55 @@ async def browser_type(ref: str, text: str, submit: bool = True, runtime: ToolRu
     Args:
         ref: The ref TOKEN from the most recent browser_snapshot output
              text: Text to type into the element
+
+        clear : boolean to clear existing text
              
         submit: Set True to submit immediately after typing (e.g. pressesEnter).
                 Use this for ALL searches — do not click a search
                 button separately.
     """
-    session = await _get_session()
-    result = await session.type(ref, text, submit=submit)
-    success = getattr(result, "success", True)
-    error = getattr(result, "error", None)
-    url = getattr(result, "url", None)
+    
+    locator = _get_locator(ref)
+    result=success=error=url= None
 
+    if locator is None:
+
+        return Command(
+            update={
+                "last_snapshot_taken": False,
+                "last_action_result": {"success": False, "error": "Locator not found, ref can't be resolved", "url": url},
+                "step_count": step_count,
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f"Typing into ref '{ref}' FAILED: "
+                            f"{error or 'ref not found or not typeable'}. "
+                            f"Call browser_snapshot to see current valid refs before trying again."
+                        ),
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ],
+            }
+        )
+
+    try:
+        if clear:
+            result = await locator.fill(text, timeout=10_000)
+        else:
+            result = await locator.press_sequentially(text, delay=50, timeout=10_000)
+        
+        if submit:
+            result = await locator.press("Enter")
+            await asyncio.sleep(5.0)
+
+        success = True
+
+    except Exception as e:
+        success = False
+        error = str(e)
+
+    page = await _get_page()
+    url = page.url if success else None
     step_count = runtime.state.get("step_count", 0) + 1
 
     if not success:
@@ -298,8 +520,8 @@ async def browser_type(ref: str, text: str, submit: bool = True, runtime: ToolRu
 @tool
 async def browser_go_back(runtime: ToolRuntime) -> Command:
     """Navigate back to the previous page in browser history."""
-    session = await _get_session()
-    result = await session.go_back()
+    page = await _get_page()
+    result = page.go_back()
     success = getattr(result, "success", True)
     error = getattr(result, "error", None)
     url = getattr(result, "url", None)
@@ -341,7 +563,7 @@ async def browser_go_back(runtime: ToolRuntime) -> Command:
 async def browser_scroll(
     direction: str = "down", amount: int = 500, ref: str | None = None, runtime: ToolRuntime = None
 ) -> Command:
-    """Scroll the page (or a specific scrollable element) up or down.
+    """Scroll the page up or down.
 
     Use this when the content you need isn't visible in the current
     snapshot — e.g. the article text is below the fold. Always follow
@@ -353,11 +575,22 @@ async def browser_scroll(
         ref: Optional ref TOKEN to scroll within a specific
              scrollable element. Omit to scroll the whole page.
     """
-    session = await _get_session()
-    result = await session.scroll(direction=direction, amount=amount, ref=ref)
+    
+    page = await _get_page()
+    
+    delta_x = 0
+    delta_y = amount if direction == "down" else -amount if direction == "up" else 0
+    if direction == "right":
+        delta_x = amount
+    elif direction == "left":
+        delta_x = -amount
+        
+    result = await page.mouse.wheel(delta_x=delta_x, delta_y=delta_y)
+    
     success = getattr(result, "success", True)
     error = getattr(result, "error", None)
     url = getattr(result, "url", None)
+    
 
     step_count = runtime.state.get("step_count", 0) + 1
 
@@ -394,41 +627,108 @@ async def browser_scroll(
 
 @tool
 async def browser_extract_content(
-    max_length: int | None = None, scope: str | None = None, runtime: ToolRuntime = None
+    max_length: int | None = None,
+    scope: str | None = None,
+    runtime: ToolRuntime = None,
 ) -> Command:
-    """Extract the FULL text content of the current page (compressed DOM +
-    markdown), not just the visible accessibility tree.
+    """Extract readable content from the current page.
 
-    Use this when you need to actually READ the content of a page — e.g.
-    an article's body text, a search result's details — rather than just
-    see what elements are clickable. browser_snapshot shows structure and
-    interactive elements; this shows the actual readable content.
+    Use this when you need to READ the actual page content after the
+    browser agent has completed its task — e.g. an article, search
+    results, product details, or other page information.
 
-    This is the tool to use before answering any question that asks you
-    to summarize, quote, or report information FROM the page. Never
-    answer from browser_snapshot output alone if the question is about
-    page content, not page structure.
+    If `scope` is provided, it is treated as a CSS selector and only
+    that section is extracted.
+
+    If `scope` is not provided, the tool automatically looks for the
+    most likely main content region using semantic HTML:
+        article → main → [role="main"] → body
 
     Args:
-        max_length: Optional cap on returned content length
-        scope: Optional CSS selector to limit extraction to one section
-               (e.g. the main article body, skipping nav/footer)
+        max_length: Optional maximum number of characters to return.
+        scope: Optional CSS selector to restrict extraction to one section.
+               Example: "article" or "#content".
     """
-    session = await _get_session()
-    content = await session.extract_content(max_length=max_length, scope=scope)
 
-    return Command(
-        update={
-            "last_snapshot": content,
-            "last_snapshot_taken": True,
-            "messages": [
-                ToolMessage(
-                    content=content,
-                    tool_call_id=runtime.tool_call_id,
-                )
-            ],
-        }
-    )
+    page = await _get_page()
+
+    try:
+        
+        if scope:
+            locator = page.locator(scope).first
+
+            if await locator.count() > 0:
+                content = (await locator.inner_text()).strip()
+            else:
+                content = ""
+                
+        else:    
+            selectors = [
+                "article",
+                "main",
+                '[role="main"]',
+            ]
+
+            best_content = ""
+
+            for selector in selectors:
+                locator = page.locator(selector)
+
+                count = await locator.count()
+
+                for i in range(count):
+                    candidate = locator.nth(i)
+
+                    try:
+                        if not await candidate.is_visible():
+                            continue
+
+                        text = (await candidate.inner_text()).strip()
+
+                        if len(text) > len(best_content):
+                            best_content = text
+
+                    except Exception:
+                        continue
+
+
+            if len(best_content) >= 300:
+                content = best_content
+                
+            else:
+                content = (
+                    await page.locator("body").inner_text()
+                ).strip()
+                
+                
+        if max_length is not None:
+            content = content[:max_length]
+
+        return Command(
+            update={
+                "last_snapshot": content,
+                "last_snapshot_taken": True,
+                "messages": [
+                    ToolMessage(
+                        content=content,
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ],
+            }
+        )
+
+    except Exception as e:
+        return Command(
+            update={
+                "last_snapshot_taken": False,
+                "messages": [
+                    ToolMessage(
+                        content=f"Content extraction failed: {e}",
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ],
+            }
+        )
 
 
 # The full toolset to bind to the agent for the perceive-act-verify loop.
@@ -442,6 +742,6 @@ BROWSER_TOOLS = [
     browser_extract_content,
 ]
 
-# NOTE: call `await close_session()` when the Browser agent's task ends
+# NOTE: call `await close_browser()` when the Browser agent's task ends
 # (success, failure, or max-steps cutoff) to release the browser process.
 # This is not a tool the model calls — it's invoked by your loop controller.
