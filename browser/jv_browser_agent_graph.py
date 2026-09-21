@@ -140,7 +140,7 @@ async def main():
     app = build_browser_agent_graph()
 
     # goal = "Order Zoro poster on Amazon"
-    goal = "Play Sparkle song by artist radwimps on youtube"
+    goal = "Play Mexican Coke song by artist CHIEF on youtube"
     state = initial_state(goal=goal, max_steps=12)
 
     config = {

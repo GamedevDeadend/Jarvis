@@ -171,16 +171,52 @@ async def _get_locator(ref_id : str):
     """
     
     if not REF_LOOKUP:
-        
+    
         logging.info("Ref lookup invalid \n\n")
         return None
     
-    role = REF_LOOKUP[ref_id]["role"]
-    name = REF_LOOKUP[ref_id]["name"]
+    
+    ref = REF_LOOKUP.get(ref_id)
 
+    if not ref:
+        
+        logging.info(f"Ref id not found: {ref_id}\n")
+        return None
+    
+    role = ref["role"]
+    name = ref["name"]
     page = await _get_page()
     locator = page.get_by_role(role=role, name=name)
-
+    count = await locator.count()
+    
+    if count == 0:
+        
+        logging.info(f"No locator found for ref={ref_id}\n")
+        return None
+    
+    if count > 1:
+        
+        logging.info("Multiple locators found \n\n")
+        
+        parent_ref_id = REF_LOOKUP[ref_id].get("parent_ref")
+        
+        if not parent_ref_id :
+            
+            logging.info(f"No parent available to resolve ref={ref_id}\n")
+            return None
+            
+        parent_locator : Locator = await _get_locator(parent_ref_id)
+        
+        if parent_locator is None:
+            return None
+        
+        locator =  parent_locator.get_by_role(role=role, name=name)
+        scoped_count = await locator.count()
+        
+        if scoped_count != 1:
+            logging.info( f"Still ambiguous for ref={ref_id}: {count} matches\n")
+            return None
+        
     return locator
 
     
@@ -190,20 +226,22 @@ def ref_map_builder(snapshot : str):
     """
 
     lines = snapshot.splitlines()
+    stack = []
 
     for line in lines:
 
         # Search refs 
-        ref_match = re.search(r"\[ref=([^\]]+)\]", line)
+        ref_match = re.search(r"^(\s*).+\[ref=([^\]]+)\]", line)
 
         if not ref_match:
             continue
 
-        ref_id = ref_match.group(1)
+        indentation_len = len(ref_match.group(1))
+        ref_id = ref_match.group(2)
 
-        # Pattern to lookup role of refs
         REF_LOOKUP[ref_id] = {"role" : "", "name" : ""}
-
+        
+        # Pattern to lookup role of refs
         role_match_group = re.search(r"^\s*-\s*([a-z]+)", line)
 
         if not role_match_group:
@@ -218,14 +256,21 @@ def ref_map_builder(snapshot : str):
 
         # name / heading of refs
         name_match = re.search(r'"(.+)"', line)
-
-        if not name_match:
-            del REF_LOOKUP[ref_id]
-            continue
-
-        name = name_match.group(1)
         
-        REF_LOOKUP[ref_id] = {"role" : role, "name" : name}
+        name = ""
+        
+        if name_match:
+            name = name_match.group(1)
+            
+        
+        while stack and REF_LOOKUP[stack[-1]].get("indentation_len") >= indentation_len:
+            stack.pop()
+        
+        parent_ref = stack[-1] if stack else None
+
+        stack.append(ref_id)
+        
+        REF_LOOKUP[ref_id] = {"role" : role, "name" : name, "indentation_len" : indentation_len, "parent_ref" : parent_ref}
 
 
 async def optimised_snapshot():

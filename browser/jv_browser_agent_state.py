@@ -22,6 +22,8 @@ class BrowserAgentState(TypedDict):
     messages: Annotated[Sequence[AnyMessage], add_messages]
 
     _start_url: str
+    
+    suggested_step : str | None
 
     goal: str
     goal_steps: str
@@ -61,6 +63,8 @@ def initial_state(
         messages=[],
 
         _start_url=start_url,
+        
+        suggested_step = "",
 
         goal=goal,
         goal_steps="",

@@ -80,14 +80,6 @@ SITE:
     
 EXAMPLES:
 
-Goal: "Go to Wikipedia and search for 'Mongols'. Tell me the first sentence."
-URL: https://www.wikipedia.org
-STEPS:
-1. browser_type — enter "Mongols" in the search field and submit
-2. browser_click — open the "Mongols" article
-3. browser_snapshot — read the first sentence
-4. browser_extract_content — extract the first sentence
-
 Goal: "Play Sparkle from Your Name movie on YouTube."
 URL: https://www.youtube.com
 STEPS:
@@ -96,17 +88,20 @@ STEPS:
 3. browser_snapshot — verify the video is playing
 4. browser_extract_content — extract playback information
 
+Goal: "Go to Wikipedia and search for 'Mongols'. Tell me the first sentence."
+URL: https://www.wikipedia.org
+STEPS:
+1. browser_type — enter "Mongols" in the search field and submit
+2. browser_click — open the "Mongols" article
+3. browser_snapshot — read the first sentence
+4. browser_extract_content — extract the first sentence
+
 Goal: "Go to https://duckduckgo.com and search for 'browsegrab'. Tell me the title of the first result."
 URL: https://duckduckgo.com
 STEPS:
 1. browser_type — enter "browsegrab" in the search field and submit
 2. browser_snapshot — read the first result's title
 3. browser_extract_content — extract the title
-
-Goal: "Go to Wikipedia."
-URL: https://www.wikipedia.org
-STEPS:
-1. browser_navigate — open Wikipedia
 
 
 OUTPUT:
@@ -223,6 +218,9 @@ async def make_observation(snapshot, goal, i:int, j:int):
 CHUNK_SELECTOR_PROMPT = """These are all the observations of various web snapshot.
 You have to decide which observation is best direction to achieve Goal.
 Keyword PASS means in that observation there was nothing relevant to goal
+
+Make sure to return Non-Zero Index 
+
 \n\n All observations : {obs}
 """
 
@@ -247,32 +245,42 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
     
     
     current_ss_length = len(snapshot)
-    ideal_char_length = 10000
+    ideal_char_length = 5000
     total_chunks = current_ss_length // ideal_char_length
     rem = current_ss_length % ideal_char_length
     
     if rem > 0 :
             total_chunks  = total_chunks+1
     
-    observations = ""
+    observations = []
     snapshot_chunks = {}
+    
+    start_index = 0
 
     for i in range(total_chunks):
-        startIndex = i * ideal_char_length
-        endIndex = startIndex + ideal_char_length
- 
-        if (total_chunks - 1) == i:
-            endIndex = (startIndex + rem)
+        
+        if start_index >= len(snapshot):
+            break
+        
+        end_index = start_index + ideal_char_length
+        end_index = min(end_index, len(snapshot))
+        
+        while end_index < len(snapshot) and snapshot[end_index] != "\n":
+            end_index += 1
 
-        result = await make_observation(snapshot, goal, startIndex, endIndex)
-        snapshot_chunks[i+1] = snapshot[startIndex : endIndex]
-        observations = observations + (f"{i+1} : {result.content}\n\n")
+        result = await make_observation(snapshot, goal, start_index, end_index)
+        snapshot_chunks[i+1] = snapshot[start_index : end_index]
+        observations.append( (f"{i+1} : {result.content}\n\n"))
+        
+        start_index = end_index
         
     
     model = ChatOllama(model=MODEL_ID, temperature=0,  num_predict=1024)
     model_with_structured_output = model.with_structured_output(Best_Observation)
     
-    messages = [SystemMessage(content=CHUNK_SELECTOR_PROMPT.format(obs=observations)),
+    combined_obs = " ".join(observations)
+    
+    messages = [SystemMessage(content=CHUNK_SELECTOR_PROMPT.format(obs=combined_obs)),
                     HumanMessage(content = f"Goal :{goal}")]
     
     result = await model_with_structured_output.ainvoke(messages)
@@ -287,7 +295,8 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
     
     return {
         "last_snapshot_taken": True,
-        "last_snapshot" : best_chunk
+        "last_snapshot" : best_chunk,
+        "suggested_step" : observations[(result.index-1)]
     }
 
 
@@ -457,19 +466,16 @@ async def goal_check_node(state: BrowserAgentState) -> str:
         logger.info(f"Goal is NOT achieved based on screenshot : {response.goal_chck_msg} \n\n")
         
 
-DECIDER_SYSTEM_PROMPT = """You are deicder node part of browser automation system. Based on page partial snapashot and other details, you will decide what next tool call to perform.
-
+DECIDER_SYSTEM_PROMPT = """You are Decider node part of browser automation system. You are give access of several browser tools. Based on page partial snapshot and other details, you will decide what next tool call to perform.
 Propose exactly ONE tool call per turn.
 
-RULE : You will be provided most RELEVAHT CHUNK of snapshot (NOT WHOLE).
+RULE : Even If Snapshot is chunked(Partial) you have to still make tool calls based on it. 
 
 RULE: Only use ref tokens (like "e11") copied exactly from the snapshot. Never guess.
 
-RULE: Never describe what you will do next. If the goal isn't met yet, call a tool now — don't just plan it.
+RULE: Never provide any summary or description of any thing. If the goal isn't met yet, call a tool now — don't just plan it.
 
 RULE : In combobox or searchbox, Use type and submit, click is not required.
-
-RULE : Conversation history is just for overall context never pick ref number from it. Old ref are for old web pages ignore them. Use new ones from snapshot
 
 If your last action was rejected, read the error and pick a different action. Do not repeat the same mistake."""
 
@@ -484,32 +490,35 @@ async def decider_node(state: BrowserAgentState) -> dict:
     """
     
     # model = ChatGroq(model=GROQ_MODEL_ID, temperature=0, max_tokens=1024, api_key=api_key)
-    model = ChatOllama(model=MODEL_ID, temperature=0, num_ctx=4096, num_predict=4096)
-    model_with_tools = model.bind_tools(BROWSER_TOOLS)
+    model = ChatOllama(model=MODEL_ID, temperature=0, num_ctx=4096, num_predict=2048)
+    model_with_tools = model.bind_tools(BROWSER_TOOLS, tool_choice="any")
 
-    context_parts = [f"GOAL: {state['goal']}"]
+    context_parts = [f"GOAL: {state['goal']}\n\n"]
+    
+    # if state.get("suggested_step"):
+    #     context_parts.append(f"Latest Observation : \n{state['suggested_step']}\n\n")
 
     if state.get("last_snapshot"):
-        context_parts.append(f"MOST RECENT SNAPSHOT (Most Relevant chunk of it) :\n{state['last_snapshot']}")
+        context_parts.append(f"CHUNKED SNAPSHOT (This is not whole Snapshot) :\n{state['last_snapshot']}\n\n")
 
     if state.get("ref_validation_error"):
         context_parts.append(
-            f"YOUR LAST PROPOSED ACTION WAS REJECTED: {state['ref_validation_error']}\n"
+            f"YOUR LAST PROPOSED ACTION WAS REJECTED: {state['ref_validation_error']}\n\n"
             f"Pick a DIFFERENT ref that actually matches the required role."
         )
 
     if state.get("last_action_result") and not state["last_action_result"].get("success"):
         context_parts.append(
             f"YOUR LAST ACTION FAILED: {state['last_action_result'].get('error')}\n"
-            f"Re-check the snapshot before trying again — do not just retry blindly."
+            f"Re-check the snapshot before trying again — do not just retry blindly.\n\n"
         )
 
     logger.info(f"Last action result: {state.get('last_action_result')}\n\n")
 
+        # SystemMessage(content = "Conversational History : \n\n"),
+        # *state.get("messages", []),
     messages = [
         SystemMessage(content=DECIDER_SYSTEM_PROMPT),
-        SystemMessage(content = "Conversational History : \n\n"),
-        *state.get("messages", []),
         HumanMessage(content="\n\n".join(context_parts)),
     ]
 
@@ -620,15 +629,18 @@ EXPECTED_ROLES = {
     Expected roles for each tool.
     These are the ARIA roles that the tool expects the ref to have in the snapshot.
     """
+    
     "browser_click": {
         "button", "link", "checkbox", "radio", "switch",
         "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
         "option", "treeitem", "gridcell", "cell", "columnheader", "rowheader",
         "listitem",
     },
+    
     "browser_type": {
         "searchbox", "textbox", "combobox", "spinbutton", "slider",
     },
+    
 }
 
 async def ref_validator_node(state: BrowserAgentState) -> dict:
