@@ -34,7 +34,7 @@ from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
 
 from browser.jv_browser_agent_state import BrowserAgentState
-from browser.jv_browser_agent_tools import BROWSER_TOOLS, _get_page, optimised_snapshot, _wait_for_load
+from browser.jv_browser_agent_tools import BROWSER_TOOLS, REF_LOOKUP, _get_page, optimised_snapshot, _wait_for_load
 
 from pydantic import BaseModel, Field
 
@@ -219,6 +219,9 @@ CHUNK_SELECTOR_PROMPT = """These are all the observations of various web snapsho
 You have to decide which observation is best direction to achieve Goal.
 Keyword PASS means in that observation there was nothing relevant to goal
 
+RULE: Base your choice only on what's stated in the observations below — do not assume content not mentioned.
+RULE: If multiple observations look equally relevant, prefer the one whose candidate ref most directly matches an action the goal requires (e.g. a search box for a search goal, a specific product/video link for an open/play goal).
+
 Make sure to return Non-Zero Index 
 
 \n\n All observations : {obs}
@@ -281,7 +284,7 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
     combined_obs = " ".join(observations)
     
     messages = [SystemMessage(content=CHUNK_SELECTOR_PROMPT.format(obs=combined_obs)),
-                    HumanMessage(content = f"Goal :{goal}")]
+                    HumanMessage(content = f"This is user query :{goal}")]
     
     result = await model_with_structured_output.ainvoke(messages)
     logging.info(f"Final Obs Index {result.index}\n Reason : {result.reason}\n\n")
@@ -437,14 +440,14 @@ async def goal_check_node(state: BrowserAgentState) -> str:
 
     
     vllm = ChatOllama(model = VL_MODEL_ID, temperature = 0, num_predict = 1024)
-    response_ss = await vllm.ainvoke(messages_ss)
+    # response_ss = await vllm.ainvoke(messages_ss)
 
-    logger.info(f"Screenshot description : {response_ss.content} \n\n")
+    # logger.info(f"Screenshot description : {response_ss.content} \n\n")
 
     
     prompt_with_context = GOAL_CHECK_PROMPT.format(
             goal=state.get("goal", "No goal found in state"),
-            screenshot_description= response_ss.content
+            screenshot_description= (f"Not providing Screenshot for now use snapshot : \n\n{state.get('last_snapshot')}")
         )
 
     
@@ -466,19 +469,42 @@ async def goal_check_node(state: BrowserAgentState) -> str:
         logger.info(f"Goal is NOT achieved based on screenshot : {response.goal_chck_msg} \n\n")
         
 
-DECIDER_SYSTEM_PROMPT = """You are Decider node part of browser automation system. You are give access of several browser tools. Based on page partial snapshot and other details, you will decide what next tool call to perform.
+DECIDER_SYSTEM_PROMPT = """You are the Decider node in a browser automation system. You are given access to several browser tools. Based on a partial page snapshot and other details, you will decide the next tool call to perform.
+
 Propose exactly ONE tool call per turn.
 
-RULE : Even If Snapshot is chunked(Partial) you have to still make tool calls based on it. 
+RULE: Even if the snapshot is chunked (partial), you must still make tool calls based on it.
 
-RULE: Only use ref tokens (like "e11") copied exactly from the snapshot. Never guess.
+RULE: Only use ref tokens (like "e11") copied exactly from the snapshot — the value inside [ref=...]. A ref token is NEVER a role name like "link", "button", or "searchbox". Never guess a ref.
 
-RULE: Never provide any summary or description of any thing. If the goal isn't met yet, call a tool now — don't just plan it.
+RULE: Never provide a summary or description of anything. If the goal isn't met yet, call a tool now — don't just plan it.
 
-RULE : In combobox or searchbox, Use type and submit, click is not required.
+RULE: Check the ROLE of the ref before picking a tool:
+  - role is "searchbox", "textbox", "combobox", "spinbutton", or "slider" -> call browser_type directly. Do NOT click it first — clicking is not required and wastes a step.
+  - role is "button", "link", "checkbox", "radio", "tab", "menuitem", "option", or similar interactive-but-not-typable roles -> call browser_click.
+
+EXAMPLES (study the ref-to-tool mapping carefully):
+
+Snapshot excerpt:
+  - searchbox "Search Amazon.in" [ref=e23]
+Correct action: browser_type(ref="e23", text="wireless mouse")
+Wrong action: browser_click(ref="e23")  # WRONG — searchbox should be typed into directly, never clicked first
+
+Snapshot excerpt:
+  - combobox "Select category" [ref=e8]
+Correct action: browser_type(ref="e8", text="Electronics")
+Wrong action: browser_click(ref="e8")  # WRONG — combobox follows the same rule as searchbox
+
+Snapshot excerpt:
+  - link "Zoro" [ref=e41]
+Correct action: browser_click(ref="e41")
+Wrong action: browser_click(ref="link")  # WRONG — "link" is the ROLE, not the ref. The ref is "e41".
+
+Snapshot excerpt:
+  - button "Add to Cart" [ref=e17]
+Correct action: browser_click(ref="e17")
 
 If your last action was rejected, read the error and pick a different action. Do not repeat the same mistake."""
-
 
 async def decider_node(state: BrowserAgentState) -> dict:
     """Pick exactly one next tool call, given goal + last snapshot + history.
@@ -491,9 +517,10 @@ async def decider_node(state: BrowserAgentState) -> dict:
     
     # model = ChatGroq(model=GROQ_MODEL_ID, temperature=0, max_tokens=1024, api_key=api_key)
     model = ChatOllama(model=MODEL_ID, temperature=0, num_ctx=4096, num_predict=2048)
-    model_with_tools = model.bind_tools(BROWSER_TOOLS, tool_choice="any")
+    model_with_tools = model.bind_tools(BROWSER_TOOLS)
 
     context_parts = [f"GOAL: {state['goal']}\n\n"]
+    context_parts.append(f"GOAL STEPS: {state.get('goal_steps', '')}")
     
     # if state.get("suggested_step"):
     #     context_parts.append(f"Latest Observation : \n{state['suggested_step']}\n\n")
@@ -554,82 +581,13 @@ async def decider_node(state: BrowserAgentState) -> dict:
         "messages": [response],
         "pending_action": pending,
     }
-
-
-class RefRoleSchema(BaseModel):
-    """
-    Schema representing the result of a ref role check.
-    """
-    role: Literal["alert", "alertdialog", "application", "article", "banner",
-    "blockquote", "button", "caption", "cell", "checkbox",
-    "code", "columnheader", "combobox", "complementary",
-    "contentinfo", "definition", "deletion", "dialog", "directory",
-    "document", "emphasis", "feed", "figure", "form", "generic",
-    "grid", "gridcell", "group", "heading", "img", "insertion",
-    "link", "list", "listbox", "listitem", "log", "main",
-    "marquee", "math", "meter", "menu", "menubar", "menuitem",
-    "menuitemcheckbox", "menuitemradio", "navigation", "none",
-    "note", "option", "paragraph", "presentation", "progressbar",
-    "radio", "radiogroup", "region", "row", "rowgroup", "rowheader",
-    "scrollbar", "search", "searchbox", "separator", "slider",
-    "spinbutton", "status", "strong", "subscript", "superscript",
-    "switch", "tab", "table", "tablist", "tabpanel", "term",
-    "textbox", "time", "timer", "toolbar", "tooltip", "tree",
-    "treegrid", "treeitem"] 
-
-
-ROLE_CHECK_PROMPT = """You are a strict accessibility-tree parser.
-Snapshot_Line:
-{snapshot_line}
-
-Find the EXACT occurrence of [ref={ref}].
-
-Return the role explicitly written for that exact ref.
-
-Rules:
-1. Do NOT infer the role from surrounding elements.
-2. Do NOT infer the role from the element's label.
-3. Do NOT infer the role from what the element is likely to do.
-4. Copy the role exactly as represented in the snapshot.
-5. If [ref={ref}] does not occur anywhere in the snapshot, return NOT_FOUND.
-"""
-
-async def _parse_ref_roles(snapshot_text: str, ref : str) -> str | None:
-    """Ask the LLM what role a specific ref has in the snapshot.
-    Returns the role string (e.g. "link", "searchbox"), or None if the
-    ref wasn't found. Replaces the old regex-based _parse_ref_roles,
-    since real testing showed the snapshot format varies too much
-    across sites (unlabeled elements, wrapped multi-line labels) for a
-    single regex to reliably cover.
-    """
-
-    ref_line = next((line for line in snapshot_text.splitlines() if ref in line), None)
-
-    logger.info(f"Ref Parser function called with snapshot {snapshot_text[:200]} and line is {ref_line}\n\n")
-
-    messages = [
-        SystemMessage(content=ROLE_CHECK_PROMPT.format(snapshot_line=ref_line, ref=ref)),
-        HumanMessage(content=f"ref={ref}"),
-    ]
-
-    model = ChatOllama(model=MODEL_ID, temperature=0)
-
-    structured_llm = model.with_structured_output(RefRoleSchema)
-    response : RefRoleSchema = await structured_llm.ainvoke(messages)
-
-    logger.info(f"[ref_role_check] ref={ref!r} -> {response.role!r}\n\n")
-
-    if response.role == "NOT_FOUND" or not response.role:
-        return None
     
-    return response.role
-
+    
 EXPECTED_ROLES = {
-    """
-    Expected roles for each tool.
-    These are the ARIA roles that the tool expects the ref to have in the snapshot.
-    """
-    
+
+    # Expected roles for each tool.
+    # These are the ARIA roles that the tool expects the ref to have in the snapshot.
+
     "browser_click": {
         "button", "link", "checkbox", "radio", "switch",
         "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
@@ -638,7 +596,7 @@ EXPECTED_ROLES = {
     },
     
     "browser_type": {
-        "searchbox", "textbox", "combobox", "spinbutton", "slider",
+        "searchbox", "search", "textbox", "combobox", "spinbutton", "slider",
     },
     
 }
@@ -664,8 +622,8 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
     if not expected_roles:
         logger.info(f"Tool not need ref {tool_name}\n\n")
         return {"ref_validation_error": None, "ref_validation_count": 0}
-
-    actual_role = await _parse_ref_roles(state.get("last_snapshot", ""), state.get("pending_action", {}).get("ref"))
+    
+    actual_role = REF_LOOKUP[ref].get('role')
 
     if actual_role is None:
         error = (

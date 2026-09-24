@@ -139,14 +139,15 @@ async def main():
     
     app = build_browser_agent_graph()
 
+    goal = "Play Re-zero latest episode on crunchyroll"
     # goal = "Order Zoro poster on Amazon"
-    goal = "Play Mexican Coke song by artist CHIEF on youtube"
+    # goal = "Play Mexican Coke song by artist CHIEF on youtube"
     state = initial_state(goal=goal, max_steps=12)
 
     config = {
             "configurable": {"thread_id": {str(uuid.uuid4())}},
-            "callbacks": [langfuse_handler],
-            "run_name" : f"goal: {goal}",
+            # "callbacks": [langfuse_handler],
+            # "run_name" : f"goal: {goal}",
         }
 
     result = await app.ainvoke(state, config)

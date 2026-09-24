@@ -169,54 +169,9 @@ async def _get_locator(ref_id : str):
     """
     Get locator using ref id from Ref_Lookup
     """
-    
-    if not REF_LOOKUP:
-    
-        logging.info("Ref lookup invalid \n\n")
-        return None
-    
-    
-    ref = REF_LOOKUP.get(ref_id)
-
-    if not ref:
-        
-        logging.info(f"Ref id not found: {ref_id}\n")
-        return None
-    
-    role = ref["role"]
-    name = ref["name"]
     page = await _get_page()
-    locator = page.get_by_role(role=role, name=name)
-    count = await locator.count()
-    
-    if count == 0:
-        
-        logging.info(f"No locator found for ref={ref_id}\n")
-        return None
-    
-    if count > 1:
-        
-        logging.info("Multiple locators found \n\n")
-        
-        parent_ref_id = REF_LOOKUP[ref_id].get("parent_ref")
-        
-        if not parent_ref_id :
-            
-            logging.info(f"No parent available to resolve ref={ref_id}\n")
-            return None
-            
-        parent_locator : Locator = await _get_locator(parent_ref_id)
-        
-        if parent_locator is None:
-            return None
-        
-        locator =  parent_locator.get_by_role(role=role, name=name)
-        scoped_count = await locator.count()
-        
-        if scoped_count != 1:
-            logging.info( f"Still ambiguous for ref={ref_id}: {count} matches\n")
-            return None
-        
+    locator = page.locator(f"aria-ref={ref_id}")
+
     return locator
 
     
@@ -321,7 +276,8 @@ async def browser_navigate(runtime: ToolRuntime, url: str) -> Command:
     """
 
     response = None
-    page = _get_page()
+    page = await _get_page()
+    step_count = runtime.state.get("step_count", 0) + 1
 
     try :
 
@@ -346,7 +302,6 @@ async def browser_navigate(runtime: ToolRuntime, url: str) -> Command:
     
     success = getattr(response, "ok", True)
     error  = None
-    step_count = runtime.state.get("step_count", 0) + 1
     
     return Command(
         update={
@@ -467,7 +422,10 @@ async def browser_click(ref: str, runtime: ToolRuntime) -> Command:
 
 @tool
 async def browser_type(ref: str, text: str, submit: bool = True, clear: bool = True, runtime: ToolRuntime = None) -> Command:
-    """ Type text into an input element on the page by its ref.
+    """ 
+    Used with roles like 'searchbox', 'search' or 'combobox' 
+    
+    Type text into an input element on the page by its ref.
         To perform a search: ALWAYS set submit=True in the SAME call that types
         the search text. Do NOT type first and click a separate button afterward
         that is unreliable and unnecessary. This tool submits the form/search
@@ -483,8 +441,9 @@ async def browser_type(ref: str, text: str, submit: bool = True, clear: bool = T
                 button separately.
     """
     
-    locator = _get_locator(ref)
+    locator = await _get_locator(ref)
     result=success=error=url= None
+    step_count = runtime.state.get("step_count", 0) + 1
 
     if locator is None:
 
@@ -524,7 +483,6 @@ async def browser_type(ref: str, text: str, submit: bool = True, clear: bool = T
 
     page = await _get_page()
     url = page.url if success else None
-    step_count = runtime.state.get("step_count", 0) + 1
 
     if not success:
         return Command(
@@ -566,7 +524,7 @@ async def browser_type(ref: str, text: str, submit: bool = True, clear: bool = T
 async def browser_go_back(runtime: ToolRuntime) -> Command:
     """Navigate back to the previous page in browser history."""
     page = await _get_page()
-    result = page.go_back()
+    result = await page.go_back()
     success = getattr(result, "success", True)
     error = getattr(result, "error", None)
     url = getattr(result, "url", None)
