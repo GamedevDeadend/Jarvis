@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+job_finder/resources/resume.pdf
+job_finder/resources/.resume_hash
+job_finder/resources/additional_requirements.txt
+job_finder/resources/jv_resume_profile.md
+job_finder/resources/jv_rules.json
+job_finder/jobs.db

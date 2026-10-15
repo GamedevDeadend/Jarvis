@@ -27,9 +27,10 @@ from browser.jv_browser_agent_nodes import (
 )
 from browser.jv_browser_agent_tools import BROWSER_TOOLS, close_browser
 
+from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env")
 
 from langfuse.langchain import CallbackHandler 
 langfuse_handler = CallbackHandler()
