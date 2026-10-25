@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 API_URL = "https://www.workingnomads.com/api/exposed_jobs/"
 HEADERS = {"User-Agent": "JobRadar/0.1 (personal job alert)"}
-_ID_REGEX = re.compile(r"/job/go/(\d+)")
+ID_REGEX = re.compile(r"/job/go/(\d+)")
 
 def html_to_text(raw: str) -> str:
     raw = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</h\d>", "\n", raw)  # keep line breaks
@@ -28,20 +28,27 @@ def fetch_working_nomads() -> list[Job]:
     items = resp.json()
 
     jobs = []
+    skipped = 0
+    
     for raw in items:
         url = raw.get("url", "")
-        id = _ID_REGEX.search(url).group(1)
-        company  = (raw.get("company_name") or "").strip()
         
-        if not id:
+        id = None
+        
+        if ID_REGEX.search(url) :
+            id = ID_REGEX.search(url).group(1)
+        else:
             skipped += 1
+            logger.warning("workingnomads: job with no id, url=%s", url)
+            
             continue
-        
+            
+        company  = (raw.get("company_name") or "").strip()
         
         jobs.append(Job(
             id=f"workingnomads:{id}",
             source="workingnomads",
-            title=raw.get("position", ""),
+            title=raw.get("title", ""),
             company=company,
             url=url,
             salary_text=f"not mentioned",
