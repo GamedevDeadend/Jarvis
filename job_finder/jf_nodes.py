@@ -10,14 +10,15 @@ from job_finder.core.jf_judge import gate, judge_batch
 from job_finder.core.jf_keyword_filter import keyword_filter
 from job_finder.core.jf_paths import RESUME_PDF
 from job_finder.core.jf_profile_builder import ensure_profile
-from job_finder.core.jf_remote_ok import fetch_remoteok
-from job_finder.core.jf_himalayas import fetch_himalayas
+from job_finder.core.sources.jf_remote_ok import fetch_remoteok
+from job_finder.core.sources.jf_himalayas import fetch_himalayas
+from job_finder.core.sources.jf_working_nomads import fetch_working_nomads
 
 from job_finder.jf_state import AgentState
 
 logger = logging.getLogger(__name__)
 
-SOURCES = [fetch_remoteok, fetch_himalayas]      # add Remotive, WorkingNomads, ... here later
+SOURCES = [fetch_remoteok, fetch_himalayas, fetch_working_nomads]      # add Remotive, WorkingNomads, ... here later
 DISCORD_PAUSE = 0.5             # seconds between posts; webhooks rate-limit bursts
 
 
