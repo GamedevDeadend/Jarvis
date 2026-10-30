@@ -16,6 +16,7 @@ import asyncio
 
 
 from langchain.tools import tool, ToolRuntime
+from langchain_community.tools import DuckDuckGoSearchRun
 from langchain.messages import ToolMessage
 from langgraph.types import Command
 

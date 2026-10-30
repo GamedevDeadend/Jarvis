@@ -34,7 +34,7 @@ from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
 
 from browser.jv_browser_agent_state import BrowserAgentState
-from browser.jv_browser_agent_tools import BROWSER_TOOLS, REF_LOOKUP, _get_page, optimised_snapshot, _wait_for_load
+from browser.jv_browser_agent_tools import BROWSER_TOOLS, REF_LOOKUP, _get_page, optimised_snapshot, _wait_for_load, _get_locator
 
 from pydantic import BaseModel, Field
 
@@ -121,6 +121,7 @@ async def initial_query_parse_node(state: BrowserAgentState) -> dict:
 
     """
     model = ChatOllama(model=MODEL_ID, temperature=0)
+    
 
     messages = [
         SystemMessage(content=INITIAL_PARSING_SYSTEM_PROMPT),
@@ -162,6 +163,77 @@ async def initial_navigate_node(state: BrowserAgentState, config=None, *, store=
         "last_action_result": {"success": success, "error": error, "url": url if success else None},
         "step_count": state.get("step_count", 0) + 1,
     }
+    
+class SearchQuerySchema(BaseModel):
+    """
+    Schema representing the result of the search query parsing.
+
+    Args:
+        search_query (str): The best search query to reach the goal.
+    """
+    search_query: str = Field(
+        description=(
+            "Best search query to reach goal. "
+            "Query: Order Zoro poster on Amazon = Result: Zoro poster on amazon "
+            "Query: Play one piece latest episode on crunchyroll -> Result: One piece latest episode on crunchyroll "
+            "Query: Order DietCoke for me from Blinkit -> Result: DietCoke on Blinkit"
+        )
+    )
+    
+async def search_query_parse_node(state: BrowserAgentState) -> dict:
+    """
+    Runs once, After User query is provided. Uses a cheap LLM call to extract best search engine query to reach goal.
+    """
+    
+    model = ChatOllama(model=MODEL_ID, temperature=0)
+    model_with_structured_output = model.with_structured_output(SearchQuerySchema)
+    response = await model_with_structured_output.ainvoke([
+        SystemMessage(content="""You are a search engine query parser. You are part of browser automation system. You have to parse user query and give best search engine query to reach goal. \n\n
+                      Examples: 
+                      Query : Order Zoro poster on Amazon -> Result: Zoro poster on amazon \n
+                      Query : Play one piece latest episode on crunchyroll -> Result: One piece latest episode on crunchyroll \n
+                      Query : Order DietCoke for me from Blinkit -> Result: DietCoke on Blinkit \n"""),
+        
+        HumanMessage(content=f'Query: "{state["goal"]}"')
+    ])
+    
+    search_query = response.search_query
+    
+    logger.info(f"Search query parsed for {state.get('goal')} : \n{search_query}\n\n")
+
+    page = await _get_page()
+    snapshot = await optimised_snapshot()
+    
+    logger.info(f"Snapshot taken of len:{len(snapshot)}\n\n" + snapshot[:2000] + "\n\n")
+    
+    result = await page.goto("https://www.google.com")
+    success = getattr(result, "ok", True)
+    error = getattr(result, "status_text", None)
+    
+    snapshot = await optimised_snapshot()
+    snapshot = snapshot[:5000]
+    
+    lines  = snapshot.splitlines()
+    
+    search_box_ref_id = None
+    
+    for line in lines:
+        combox_string = re.search(r'combobox\s*"Search"', line)
+        
+        if combox_string is not None:
+            logger.info(f"Search box found in snapshot : {line} \n\n")
+            search_box_ref_id = re.search(r'\[ref=(.*?)\]', line).group(1)
+            break
+        
+    if search_box_ref_id is None:
+        logger.error(f"Search box not found in snapshot : {snapshot[:5000]} \n\n")
+        return {}
+        
+    search_box_locator = await _get_locator(search_box_ref_id)
+    await search_box_locator.fill(search_query)
+    await search_box_locator.press("Enter")
+    
+    return {}
     
     
 async def observer_node(state: BrowserAgentState) -> dict:
@@ -293,6 +365,10 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
         result.index = 1
     
     best_chunk = snapshot_chunks.get(result.index)
+    
+    if(best_chunk is None):
+        logging.info(f"Best Chunk is None. Using first chunk as best chunk \n\n")
+        best_chunk = snapshot_chunks.get(1)
     
     logging.info(f" Length of new SS : {len(best_chunk)}\n\nSS : {best_chunk[:5000]}\n\n")
     

@@ -18,6 +18,7 @@ from browser.jv_browser_agent_nodes import (
     initial_query_parse_node,
     initial_navigate_node,
     observer_node,
+    search_query_parse_node,
     snapshot_optimizer_node,
     plan_reviewer_node,
     decider_node,
@@ -108,8 +109,9 @@ def build_browser_agent_graph():
 
     graph = StateGraph(BrowserAgentState)
 
-    graph.add_node("initial_query_parse_node", initial_query_parse_node)
-    graph.add_node("initial_navigate_node", initial_navigate_node)
+    # graph.add_node("initial_query_parse_node", initial_query_parse_node)
+    # graph.add_node("initial_navigate_node", initial_navigate_node)
+    graph.add_node("search_query_parse_node", search_query_parse_node)
     graph.add_node("observer_node", observer_node)
     graph.add_node("snapshot_optimizer_node", snapshot_optimizer_node)
     graph.add_node("plan_reviewer_node", plan_reviewer_node)
@@ -120,9 +122,10 @@ def build_browser_agent_graph():
     graph.add_node("end_message_node", end_message_node)
     graph.add_node("human_feedback_node", human_feedback_node)
 
-    graph.add_edge(START, "initial_query_parse_node")
-    graph.add_edge("initial_query_parse_node", "initial_navigate_node")
-    graph.add_edge("initial_navigate_node", "observer_node")
+    # graph.add_edge(START, "initial_query_parse_node")
+    # graph.add_edge("initial_query_parse_node", "initial_navigate_node")
+    graph.add_edge(START, "search_query_parse_node")
+    graph.add_edge("search_query_parse_node", "observer_node")
     graph.add_edge( "observer_node", "snapshot_optimizer_node",)
     graph.add_edge( "snapshot_optimizer_node","plan_reviewer_node")
     graph.add_edge("plan_reviewer_node", "goal_check_node")
@@ -140,9 +143,10 @@ async def main():
     
     app = build_browser_agent_graph()
 
-    goal = "Play Re-zero latest episode on crunchyroll"
+    # goal = "Play Re-zero latest episode on crunchyroll"
+    # goal = "Order me dietcoke from Swiggy Instamart"
     # goal = "Order Zoro poster on Amazon"
-    # goal = "Play Mexican Coke song by artist CHIEF on youtube"
+    goal = "Play Mexican Coke song by artist CHIEF on youtube"
     state = initial_state(goal=goal, max_steps=12)
 
     config = {
