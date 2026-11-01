@@ -15,10 +15,9 @@ from langgraph.prebuilt import ToolNode
 from browser.jv_browser_agent_state import BrowserAgentState, initial_state
 from browser.jv_browser_agent_nodes import (
     goal_check_node,
-    initial_query_parse_node,
-    initial_navigate_node,
+    initial_planning_node,
     observer_node,
-    search_query_parse_node,
+    initial_search_node,
     snapshot_optimizer_node,
     plan_reviewer_node,
     decider_node,
@@ -111,7 +110,8 @@ def build_browser_agent_graph():
 
     # graph.add_node("initial_query_parse_node", initial_query_parse_node)
     # graph.add_node("initial_navigate_node", initial_navigate_node)
-    graph.add_node("search_query_parse_node", search_query_parse_node)
+    graph.add_node("initial_planning_node", initial_planning_node)
+    graph.add_node("initial_search_node", initial_search_node)
     graph.add_node("observer_node", observer_node)
     graph.add_node("snapshot_optimizer_node", snapshot_optimizer_node)
     graph.add_node("plan_reviewer_node", plan_reviewer_node)
@@ -124,8 +124,9 @@ def build_browser_agent_graph():
 
     # graph.add_edge(START, "initial_query_parse_node")
     # graph.add_edge("initial_query_parse_node", "initial_navigate_node")
-    graph.add_edge(START, "search_query_parse_node")
-    graph.add_edge("search_query_parse_node", "observer_node")
+    graph.add_edge(START, "initial_planning_node")
+    graph.add_edge("initial_planning_node", "initial_search_node")
+    graph.add_edge("initial_search_node", "observer_node")
     graph.add_edge( "observer_node", "snapshot_optimizer_node",)
     graph.add_edge( "snapshot_optimizer_node","plan_reviewer_node")
     graph.add_edge("plan_reviewer_node", "goal_check_node")
@@ -142,17 +143,71 @@ def build_browser_agent_graph():
 async def main(): 
     
     app = build_browser_agent_graph()
+    
+    [
+        # goal = "Play Re-zero latest episode on crunchyroll" 
+        # Result : Failed due to bot detection # Failed Bot Detection 
+        
+        # goal = "Order Kitkat from flipkart"
+        # Result = Failed out of stock
+        
+        # goal = "Order Zoro poster on Amazon"
+        # Result : Passed
+        
+        # goal = "Play Mexican Coke song by artist CHIEF on youtube"
 
+        # Play / media
+        # goal = "Play Blinding Lights by The Weeknd on youtube"
+        # goal = "Play the latest episode of One Piece on crunchyroll"
+        # goal = "Play the official trailer of Dune Part Two on youtube"
+
+        # Add to cart
+        # goal = "Add a Logitech wireless mouse to cart on Amazon"
+        # goal = "Order Oreo biscuits from Swiggy Instamart"
+        # goal = "Add a Naruto poster to cart on Flipkart"
+
+        # Read and extract
+        # goal = "Find the runtime and IMDb rating of Interstellar"
+        # goal = "Find the opening hours and adult ticket price of the Louvre Museum"
+        # goal = "Find the population of Jaipur on Wikipedia and who founded the city"
+
+        # Failure behavior
+        # goal = 'Play the episode "Zorblax Returns" of the show Mythwalkers on crunchyroll'
+    ]
+    
+    
+    
+    
+    
     # goal = "Play Re-zero latest episode on crunchyroll"
-    # goal = "Order me dietcoke from Swiggy Instamart"
+    goal = "Order Pillow from flipkart"
     # goal = "Order Zoro poster on Amazon"
-    goal = "Play Mexican Coke song by artist CHIEF on youtube"
+    # goal = "Play Mexican Coke song by artist CHIEF on youtube"
+
+    # Play / media
+    # goal = "Play Blinding Lights by The Weeknd on youtube"
+    # goal = "Play the latest episode of One Piece on crunchyroll"
+    # goal = "Play the official trailer of Dune Part Two on youtube"
+
+    # Add to cart
+    # goal = "Add a Logitech wireless mouse to cart on Amazon"
+    # goal = "Order Oreo biscuits from Swiggy Instamart"
+    # goal = "Add a Naruto poster to cart on Flipkart"
+
+    # Read and extract
+    # goal = "Find the runtime and IMDb rating of Interstellar"
+    # goal = "Find the opening hours and adult ticket price of the Louvre Museum"
+    # goal = "Find the population of Jaipur on Wikipedia and who founded the city"
+
+    # Failure behavior
+    # goal = 'Play the episode "Zorblax Returns" of the show Mythwalkers on crunchyroll'
+    
     state = initial_state(goal=goal, max_steps=12)
 
     config = {
             "configurable": {"thread_id": {str(uuid.uuid4())}},
-            # "callbacks": [langfuse_handler],
-            # "run_name" : f"goal: {goal}",
+            "callbacks": [langfuse_handler],
+            "run_name" : f"goal: {goal}",
         }
 
     result = await app.ainvoke(state, config)

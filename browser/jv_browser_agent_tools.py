@@ -198,7 +198,7 @@ def ref_map_builder(snapshot : str):
         REF_LOOKUP[ref_id] = {"role" : "", "name" : ""}
         
         # Pattern to lookup role of refs
-        role_match_group = re.search(r"^\s*-\s*([a-z]+)", line)
+        role_match_group = re.search(r"^\s*-\s*'?([a-z]+)", line)
 
         if not role_match_group:
             del REF_LOOKUP[ref_id]

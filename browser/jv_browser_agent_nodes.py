@@ -29,6 +29,7 @@ from typing import Literal
 from langgraph.types import interrupt, Command
 
 from langchain.messages import SystemMessage, HumanMessage
+from langchain_typesafe import Score, TypeSafeClassifier
 
 from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
@@ -49,14 +50,13 @@ MODEL_ID = "qwen2.5:3b"
 VL_MODEL_ID = "qwen3.5:0.8b"
 
 
-class IntialParsingSchema(BaseModel) :
+
+class InitialPlanningSchema(BaseModel) :
     """ 
-        Schema representing the result of the initial parsing of the goal.
+        Schema representing the result of the initial planning of the goal.
         Args:
-            intial_url (str): The initial URL to navigate to.
             goal_steps (str): The steps to reach the goal in the query.
     """
-    initial_url : str  = Field(description="Initial url which agent should navigate to start the process . Example https://www.youtube.com, https://www.wikipedia.org ")
     goal_steps : str = Field(description="""Steps to reach goal in query. Break Goal in steps. STEPS:
                                 1. <first step>
                                 2. <second step>
@@ -64,106 +64,104 @@ class IntialParsingSchema(BaseModel) :
                                 ...""")
 
 
-INITIAL_PARSING_SYSTEM_PROMPT = """
-
+INITIAL_PLANNING_SYSTEM_PROMPT = """
 You are a Browser-agent goal planner.
 
-Convert the user's goal into:
-1. A starting URL.(Note : Region is India)
-2. A minimal ordered list of actions using the available browser tools
+Convert the user's goal into a minimal ordered list of actions using ONLY these browser tools:
+- browser_navigate: navigate to a particular URL
+- browser_snapshot: take a snapshot of the current webpage
+- browser_click: click a particular button, link, etc.
+- browser_type: type text in a textbox, searchbox, combobox, etc.
+- browser_go_back: go to the previous page
+- browser_scroll: scroll the web page
+- browser_extract_content: extract information such as an article, paragraph, etc.
 
-SITE:
-- Explicit URL → use it.
-- Named/implied website → use that website.
-- Otherwise → https://www.google.com
+RULES:
+1. The first step is ALWAYS fixed: go to google.com, search for a query related to the goal, and click one of the most relevant results.
+2. Keep the plan minimal. Do not add unnecessary steps.
+3. Use browser_snapshot after a page loads or changes, before clicking or typing on it.
+4. Use browser_extract_content only when the goal requires reading information from a page.
+5. "Order" or "buy" in a goal means ONLY add the item to the cart. Never proceed to checkout, payment, or place the order.
+6. Output only the numbered plan, in the format: "N. tool_name: short description".
 
-    
 EXAMPLES:
 
-Goal: "Play Sparkle from Your Name movie on YouTube."
-URL: https://www.youtube.com
-STEPS:
-1. browser_type — enter "Sparkle Your Name" in the search field and submit
-2. browser_click — open the relevant video
-3. browser_snapshot — verify the video is playing
-4. browser_extract_content — extract playback information
+Goal: Play Re-zero latest episode on crunchyroll
+Plan:
+1. browser_navigate: Go to google.com
+2. browser_type: Type "Re:Zero crunchyroll" in the search box
+3. browser_click: Click the Crunchyroll Re:Zero series result
+4. browser_snapshot: Take a snapshot of the series page
+5. browser_scroll: Scroll down to the episodes list
+6. browser_snapshot: Take a snapshot to identify the latest episode
+7. browser_click: Click the latest episode
+8. browser_snapshot: Take a snapshot of the episode page
+9. browser_click: Click the play button
 
-Goal: "Go to Wikipedia and search for 'Mongols'. Tell me the first sentence."
-URL: https://www.wikipedia.org
-STEPS:
-1. browser_type — enter "Mongols" in the search field and submit
-2. browser_click — open the "Mongols" article
-3. browser_snapshot — read the first sentence
-4. browser_extract_content — extract the first sentence
+Goal: Order me dietcoke from Swiggy Instamart
+Plan:
+1. browser_navigate: Go to google.com
+2. browser_type: Type "Diet coke Swiggy Instamart" in the search box
+3. browser_click: Click the most relevant Swiggy Instamart result
+4. browser_snapshot: Take a snapshot of the results page
+5. browser_click: Click the most relevant diet coke product
+7. browser_snapshot: Take a snapshot of the product page
+8. browser_click: Click "Add" on the Diet Coke
+9. browser_snapshot: Confirm the item is in the cart (do not checkout)
 
-Goal: "Go to https://duckduckgo.com and search for 'browsegrab'. Tell me the title of the first result."
-URL: https://duckduckgo.com
-STEPS:
-1. browser_type — enter "browsegrab" in the search field and submit
-2. browser_snapshot — read the first result's title
-3. browser_extract_content — extract the title
+Goal: Order Zoro poster on Amazon
+Plan:
+1. browser_navigate: Go to google.com
+2. browser_type: Type "Zoro poster Amazon" in the search box
+3. browser_click: Click the most relevant Amazon result
+4. browser_snapshot: Take a snapshot of the results page
+5. browser_click: Click the most relevant Zoro poster product
+6. browser_snapshot: Take a snapshot of the product page
+7. browser_click: Click "Add to Cart"
+8. browser_snapshot: Confirm the item is in the cart (do not checkout)
 
+Goal: Play Mexican Coke song by artist CHIEF on youtube
+Plan:
+1. browser_navigate: Go to google.com
+2. browser_type: Type "Mexican Coke CHIEF youtube" in the search box
+3. browser_click: Click the YouTube result for the song
+4. browser_snapshot: Take a snapshot of the video page
+5. browser_click: Click the play button if the video is not already playing
 
-OUTPUT:
-URL: <starting URL>
-STEPS:
-1. <tool_name> — <action>
-2. <tool_name> — <action>
+Goal: Find the opening hours of the Louvre Museum and the ticket price for adults.
+Plan:
+1. browser_navigate: Go to google.com
+2. browser_type: Type "Louvre Museum official website opening hours tickets" in the search box
+3. browser_click: Click the official Louvre website result
+4. browser_snapshot: Take a snapshot of the homepage
+5. browser_click: Click the "Practical information" or "Tickets" link
+6. browser_snapshot: Take a snapshot of the new page
+7. browser_extract_content: Extract opening hours and adult ticket price
+
+Now plan for the user's goal below.
 """
 
-
-async def initial_query_parse_node(state: BrowserAgentState) -> dict:
+async def initial_planning_node(state: BrowserAgentState) -> dict:
     """
-    Runs once, before initial_navigate_node. Uses a cheap LLM call to
-    extract which site the goal implies AND break the goal into ordered
-    steps, instead of requiring the caller to pass _start_url explicitly
-    or leaving the Decider to infer the whole multi-step plan on its own.
-
+    Runs once to generate the initial plan to reach the goal.
     """
     model = ChatOllama(model=MODEL_ID, temperature=0)
     
-
     messages = [
-        SystemMessage(content=INITIAL_PARSING_SYSTEM_PROMPT),
+        SystemMessage(content=INITIAL_PLANNING_SYSTEM_PROMPT),
         HumanMessage(content=f'Goal: "{state["goal"]}"'),
     ]
 
-    structured_llm = model.with_structured_output(IntialParsingSchema)
-    response : IntialParsingSchema = await structured_llm.ainvoke(messages)
-
-    url = response.initial_url
-    goal_lines = "\n" + response.goal_steps
-
-    logger.info(f" Initial url : {url} \n\n")
+    # structured_llm = model.with_structured_output(InitialPlanningSchema)
+    response : InitialPlanningSchema = await model.ainvoke(messages)
+    
+    goal_lines = "\n" + response.content
+    logger.info(f"Steps for {state.get('goal')} : \n{response}\n\n")
     logger.info(f"Steps for {state.get('goal')} : \n{goal_lines}\n\n")
 
-    return {"_start_url" : url, "goal_steps" : goal_lines, "human_feedback" : None}
+    return {"goal_steps" : goal_lines, "human_feedback" : None}
 
-
-async def initial_navigate_node(state: BrowserAgentState, config=None, *, store=None) -> dict:
-    """
-        Query -> Initial navigate. Hardcoded, not Decider-driven: step zero
-        always opens the target site, so there's no need to spend an LLM call
-        deciding to do the obvious first action.
-    """
-
-    logger.info(f"Initial navigation node called with url = {state.get('_start_url')} \n\n")
-
-    url = state.get("_start_url", "https://www.wikipedia.org")
-
-    page = await _get_page()
-    result = await page.goto(url)
-    success = getattr(result, "ok", True)
-    error = getattr(result, "status_text", None)
-
-    logger.info(f"Navigation results :\n {result} \n\n")
-
-    return {
-        "last_snapshot_taken": False,
-        "last_action_result": {"success": success, "error": error, "url": url if success else None},
-        "step_count": state.get("step_count", 0) + 1,
-    }
-    
+        
 class SearchQuerySchema(BaseModel):
     """
     Schema representing the result of the search query parsing.
@@ -180,11 +178,7 @@ class SearchQuerySchema(BaseModel):
         )
     )
     
-async def search_query_parse_node(state: BrowserAgentState) -> dict:
-    """
-    Runs once, After User query is provided. Uses a cheap LLM call to extract best search engine query to reach goal.
-    """
-    
+async def generate_search_query(state):
     model = ChatOllama(model=MODEL_ID, temperature=0)
     model_with_structured_output = model.with_structured_output(SearchQuerySchema)
     response = await model_with_structured_output.ainvoke([
@@ -193,11 +187,18 @@ async def search_query_parse_node(state: BrowserAgentState) -> dict:
                       Query : Order Zoro poster on Amazon -> Result: Zoro poster on amazon \n
                       Query : Play one piece latest episode on crunchyroll -> Result: One piece latest episode on crunchyroll \n
                       Query : Order DietCoke for me from Blinkit -> Result: DietCoke on Blinkit \n"""),
-        
         HumanMessage(content=f'Query: "{state["goal"]}"')
     ])
     
     search_query = response.search_query
+    return search_query
+    
+async def initial_search_node(state: BrowserAgentState) -> dict:
+    """
+    Runs once, After User query is provided. Uses a cheap LLM call to extract best search engine query to reach goal.
+    """
+    
+    search_query = await generate_search_query(state)
     
     logger.info(f"Search query parsed for {state.get('goal')} : \n{search_query}\n\n")
 
@@ -206,16 +207,13 @@ async def search_query_parse_node(state: BrowserAgentState) -> dict:
     
     logger.info(f"Snapshot taken of len:{len(snapshot)}\n\n" + snapshot[:2000] + "\n\n")
     
-    result = await page.goto("https://www.google.com")
-    success = getattr(result, "ok", True)
-    error = getattr(result, "status_text", None)
+    await page.goto("https://www.google.com")
     
     snapshot = await optimised_snapshot()
     snapshot = snapshot[:5000]
     
-    lines  = snapshot.splitlines()
-    
     search_box_ref_id = None
+    lines  = snapshot.splitlines()
     
     for line in lines:
         combox_string = re.search(r'combobox\s*"Search"', line)
@@ -225,12 +223,13 @@ async def search_query_parse_node(state: BrowserAgentState) -> dict:
             search_box_ref_id = re.search(r'\[ref=(.*?)\]', line).group(1)
             break
         
+        
     if search_box_ref_id is None:
         logger.error(f"Search box not found in snapshot : {snapshot[:5000]} \n\n")
         return {}
         
     search_box_locator = await _get_locator(search_box_ref_id)
-    await search_box_locator.fill(search_query)
+    await search_box_locator.press_sequentially(search_query, delay=2.0)
     await search_box_locator.press("Enter")
     
     return {}
@@ -269,6 +268,7 @@ Best_Candidate : Searchbox with ref e20 because this can be used to search produ
 Anything along those lines.
 
 NOTE : As There will be multiple snapshot you can also give your observation as PASS.
+NOTE : Don't Focus on non interactable elements like heading, paragraph, text, img.
 
 Recent Snapshot : 
 
@@ -277,10 +277,10 @@ Recent Snapshot :
 
 async def make_observation(snapshot, goal, i:int, j:int):
 
-    model = ChatOllama(model=MODEL_ID, temperature=0,  num_predict=1024)
+    model = ChatOllama(model=MODEL_ID, temperature=0,  num_predict=2048)
 
     messages = [SystemMessage(content=CHUNK_OBSERVER_PROPMPT.format(snapshot=snapshot[i:j])),
-                HumanMessage(content = f"Goal : {goal}")]
+                HumanMessage(content = f"This is Goal : {goal}")]
 
     result = await model.ainvoke(messages)
 
@@ -300,7 +300,7 @@ Make sure to return Non-Zero Index
 """
 
 class Best_Observation(BaseModel):
-    index : int = Field (description="Give Index of best observation from all the observation")
+    index : int = Field (description="Give Non-Zero Index of best observation from all the observation")
     reason : str = Field (description="Reason to select this observation")
     
 async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
@@ -311,6 +311,7 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
     """
     
     #Filter SS
+    classifier = TypeSafeClassifier(model="tev1:0.8b")
     snapshot = state.get("last_snapshot") or ""
     goal = state.get("goal") or ""
     
@@ -320,49 +321,75 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
     
     
     current_ss_length = len(snapshot)
-    ideal_char_length = 5000
+    ideal_char_length = 3000
     total_chunks = current_ss_length // ideal_char_length
     rem = current_ss_length % ideal_char_length
     
     if rem > 0 :
             total_chunks  = total_chunks+1
     
-    observations = []
+    observations = {}
     snapshot_chunks = {}
-    
     start_index = 0
+    end_index = 0
+    
+    snapshot_lookup = {}
+    max_score = -1.0
 
     for i in range(total_chunks):
         
-        if start_index >= len(snapshot):
+        if start_index >= current_ss_length:
             break
         
         end_index = start_index + ideal_char_length
-        end_index = min(end_index, len(snapshot))
+        end_index = min(end_index, current_ss_length)
         
-        while end_index < len(snapshot) and snapshot[end_index] != "\n":
+        while end_index < current_ss_length and snapshot[end_index] != "\n":
             end_index += 1
 
-        result = await make_observation(snapshot, goal, start_index, end_index)
+        # result = await make_observation(snapshot, goal, start_index, end_index)
+        
+        
         snapshot_chunks[i+1] = snapshot[start_index : end_index]
-        observations.append( (f"{i+1} : {result.content}\n\n"))
+        
+        payload = {
+            "state" : f" This chunk of snapshot of current webpage  : {snapshot_chunks[i+1]}",
+            "questions" : {
+                f"Relevancy_Score_{i+1}" : Score(
+                    instructions = f"""How relevant / close this snapshot chunk is to the goal? 
+                    The goal is : {goal}.""",
+                    criteria = ["Not relevant at all",  "Relevant", "Extremely relevant"]
+                )
+            }
+        }
+        
+        result  = await classifier.ainvoke(payload)
+        score = result.scores[f"Relevancy_Score_{i+1}"].score
+        snapshot_lookup[ score ] = snapshot_chunks[i+1]
+        
+        if score > max_score:
+            max_score = score
+
+        observations[i+1] = result
         
         start_index = end_index
         
+        
+    for  row in snapshot_lookup.keys():
+        logging.info(f"score : {row} \n\n Snapshot : {snapshot_lookup[row][:5000]}\n\n")
+        
+        
     
-    model = ChatOllama(model=MODEL_ID, temperature=0,  num_predict=1024)
+    model = ChatOllama(model=MODEL_ID, temperature=0,  num_predict=2048)
     model_with_structured_output = model.with_structured_output(Best_Observation)
     
-    combined_obs = " ".join(observations)
+    combined_obs = "\n\n".join(f"{k} : {v}" for k, v in observations.items())
     
     messages = [SystemMessage(content=CHUNK_SELECTOR_PROMPT.format(obs=combined_obs)),
-                    HumanMessage(content = f"This is user query :{goal}")]
+                    HumanMessage(content = f"This is a goal :{goal}")]
     
     result = await model_with_structured_output.ainvoke(messages)
     logging.info(f"Final Obs Index {result.index}\n Reason : {result.reason}\n\n")
-    
-    if result.index == 0:
-        result.index = 1
     
     best_chunk = snapshot_chunks.get(result.index)
     
@@ -375,19 +402,43 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
     return {
         "last_snapshot_taken": True,
         "last_snapshot" : best_chunk,
-        "suggested_step" : observations[(result.index-1)]
+        "suggested_step" : observations.get(result.index)
     }
 
 
 PLAN_REVIEWER_PROMPT = """
-You are plan review agent working in browser automation system. Your goal is to review and edit our intial plans if needed.
-Based on relevant snapshot chunk, our goal and last action result. You will update the plan. 
-Update the plan only if required, it is not compulsion.
+You are plan reviewer agent.Your goal is to review and edit our intial plans if needed. Update the plan only if required, it is not compulsion.
 
-CAUTION : Make sure revised steps are in similar format as of old ones. DON'T change the way steps were written.
+Browser automation agent has following tools available:
+- browser_navigate: navigate to a particular URL
+- browser_snapshot: take a snapshot of the current webpage
+- browser_click: click a particular button, link, etc.
+- browser_type: type text in a textbox, searchbox, combobox, etc.
+- browser_go_back: go to the previous page
+- browser_scroll: scroll the web page
+- browser_extract_content: extract information such as an article, paragraph, etc.
 
-Goal or Query : 
-{goal}
+RULES:
+1. The first step is ALWAYS fixed: go to google.com, search for a query related to the goal, and click one of the most relevant results.
+3. Use browser_snapshot after a page loads or changes, before clicking or typing on it.
+4. Use browser_extract_content only when the goal requires reading information from a page.
+5. "Order" or "buy" in a goal means ONLY add the item to the cart. Never proceed to checkout, payment, or place the order.
+6. Output only the numbered plan, in the format: "N. tool_name: short description".
+
+Example : 
+
+1. browser_navigate: Go to google.com
+2. browser_type: Type "Zoro poster Amazon" in the search box
+3. browser_click: Click the most relevant Amazon result
+4. browser_snapshot: Take a snapshot of the results page
+5. browser_click: Click the most relevant Zoro poster product
+6. browser_snapshot: Take a snapshot of the product page
+7. browser_click: Click "Add to Cart"
+8. browser_snapshot: Confirm the item is in the cart (do not checkout)
+
+
+Goal Steps : 
+{goal_steps}
 
 Last action result:
 {last_action_result}
@@ -406,21 +457,20 @@ async def plan_reviewer_node(state:BrowserAgentState)->dict:
     Plan Reviewer Node : Its function is to check latest developments in loop and update plan if needed
     """
     
-    new_goal_steps = state.get("goal_steps") or ""
+    goal_steps = state.get("goal_steps") or ""
     goal = state.get("goal") or ""
-    snapshot = state.get("last_snap_shot") or ""
+    snapshot = state.get("last_snapshot") or ""
     last_result = state.get("last_action_result") or ""
     
     model = ChatOllama(model=MODEL_ID, temperature=0,  num_predict=2048)
-    response = await model.ainvoke( [SystemMessage(content = PLAN_REVIEWER_PROMPT.format(goal=goal, last_action_result=last_result, latest_snapshot=snapshot))])
+    response = await model.ainvoke( [SystemMessage(content = PLAN_REVIEWER_PROMPT.format(goal_steps=goal_steps, last_action_result=last_result, latest_snapshot=snapshot))])
     
     new_goal_steps = response.content
     
     logging.info(f"New Steps :\n\n{new_goal_steps}\n\n")
     
-    return{}
-    
-    # return {"goal_steps" : new_goal_steps}
+    # return{}
+    return {"goal_steps" : new_goal_steps}
 
 
 GOAL_CHECK_PROMPT = """
@@ -488,48 +538,53 @@ async def goal_check_node(state: BrowserAgentState) -> str:
         logger.error(f"Error while getting page : {e} \n\n")
         return {}
     
-    page_screenshot_bytes = await page.screenshot()
+    # page_screenshot_bytes = await page.screenshot()
     
-    image_b64 = base64.b64encode(page_screenshot_bytes).decode("utf-8")
+    # image_b64 = base64.b64encode(page_screenshot_bytes).decode("utf-8")
     logger.info(f"Screenshot is being taken for goal check : \n\n")
     
-    messages_ss = [
-        SystemMessage(
-            content = (
-                "You are a screenshot describer. You provide a detailed visual "
-                "description of the given image, so that it can be used to check "
-                "whether the user's goal has been achieved or not."
-            )
-        ),
+    # messages_ss = [
+    #     SystemMessage(
+    #         content = (
+    #             "You are a screenshot describer. You provide a detailed visual "
+    #             "description of the given image, so that it can be used to check "
+    #             "whether the user's goal has been achieved or not."
+    #         )
+    #     ),
 
-        HumanMessage(
-            content= [
-                {"type": "text", "text": "Describe the screenshot in detail. Focus on the visual elements, layout, and any text present."},
+    #     HumanMessage(
+    #         content= [
+    #             {"type": "text", "text": "Describe the screenshot in detail. Focus on the visual elements, layout, and any text present."},
 
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                }
-            ]
-        )
-    ]
-
-    
-    vllm = ChatOllama(model = VL_MODEL_ID, temperature = 0, num_predict = 1024)
-    # response_ss = await vllm.ainvoke(messages_ss)
-
-    # logger.info(f"Screenshot description : {response_ss.content} \n\n")
+    #             {
+    #                 "type": "image_url",
+    #                 "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+    #             }
+    #         ]
+    #     )
+    # ]
 
     
+    vllm = ChatOllama(model = VL_MODEL_ID, temperature = 0.3, num_predict = 2048)
+    
+    response_ss = "Vision analysis disabled during testing."
+    
+    # try:
+    #     response_ss = await vllm.ainvoke(messages_ss)
+    # except Exception as e:
+    #     logger.warning(f"Vision check failed: {e}")
+    #     response_ss = await vllm.ainvoke(messages_ss)
+
+
     prompt_with_context = GOAL_CHECK_PROMPT.format(
             goal=state.get("goal", "No goal found in state"),
-            screenshot_description= (f"Not providing Screenshot for now use snapshot : \n\n{state.get('last_snapshot')}")
+            screenshot_description= (response_ss)
         )
 
     
         
-    # llm = ChatGroq(model=GROQ_MODEL_ID, temperature=0, max_tokens=2048, api_key=api_key)
-    llm = ChatOllama(model=MODEL_ID, temperature=0, num_predict=1024)
+    llm = ChatGroq(model=GROQ_MODEL_ID, temperature=0, max_tokens=2048, api_key=api_key)
+    # llm = ChatOllama(model=MODEL_ID, temperature=0, num_predict=1024)
     structured_llm = llm.with_structured_output(GoalCheckSchema)
     response : GoalCheckSchema = await structured_llm.ainvoke(prompt_with_context)
 
@@ -543,44 +598,33 @@ async def goal_check_node(state: BrowserAgentState) -> str:
     
     else:
         logger.info(f"Goal is NOT achieved based on screenshot : {response.goal_chck_msg} \n\n")
-        
+        return {
+            "is_goal_reached": False,
+            "final_answer": None
+        }
 
-DECIDER_SYSTEM_PROMPT = """You are the Decider node in a browser automation system. You are given access to several browser tools. Based on a partial page snapshot and other details, you will decide the next tool call to perform.
+DECIDER_SYSTEM_PROMPT = """You are the Decider node in a browser automation system.
 
+The browser automation agent has the following tools available:
+- browser_navigate: navigate to a particular URL
+- browser_snapshot: take a snapshot of the current webpage
+- browser_click: click a particular button, link, etc.
+- browser_type: type text in a textbox, searchbox, combobox, etc.
+- browser_go_back: go to the previous page
+- browser_scroll: scroll the web page
+- browser_extract_content: extract information such as an article, paragraph, etc.
+
+Based on a partial page snapshot and other details, you will decide the next tool call to perform.
 Propose exactly ONE tool call per turn.
 
 RULE: Even if the snapshot is chunked (partial), you must still make tool calls based on it.
-
 RULE: Only use ref tokens (like "e11") copied exactly from the snapshot — the value inside [ref=...]. A ref token is NEVER a role name like "link", "button", or "searchbox". Never guess a ref.
-
 RULE: Never provide a summary or description of anything. If the goal isn't met yet, call a tool now — don't just plan it.
 
 RULE: Check the ROLE of the ref before picking a tool:
-  - role is "searchbox", "textbox", "combobox", "spinbutton", or "slider" -> call browser_type directly. Do NOT click it first — clicking is not required and wastes a step.
+  - role is "searchbox", "textbox", "combobox", "spinbutton", or "slider" -> call browser_type directly.
   - role is "button", "link", "checkbox", "radio", "tab", "menuitem", "option", or similar interactive-but-not-typable roles -> call browser_click.
-
-EXAMPLES (study the ref-to-tool mapping carefully):
-
-Snapshot excerpt:
-  - searchbox "Search Amazon.in" [ref=e23]
-Correct action: browser_type(ref="e23", text="wireless mouse")
-Wrong action: browser_click(ref="e23")  # WRONG — searchbox should be typed into directly, never clicked first
-
-Snapshot excerpt:
-  - combobox "Select category" [ref=e8]
-Correct action: browser_type(ref="e8", text="Electronics")
-Wrong action: browser_click(ref="e8")  # WRONG — combobox follows the same rule as searchbox
-
-Snapshot excerpt:
-  - link "Zoro" [ref=e41]
-Correct action: browser_click(ref="e41")
-Wrong action: browser_click(ref="link")  # WRONG — "link" is the ROLE, not the ref. The ref is "e41".
-
-Snapshot excerpt:
-  - button "Add to Cart" [ref=e17]
-Correct action: browser_click(ref="e17")
-
-If your last action was rejected, read the error and pick a different action. Do not repeat the same mistake."""
+"""
 
 async def decider_node(state: BrowserAgentState) -> dict:
     """Pick exactly one next tool call, given goal + last snapshot + history.
@@ -596,10 +640,10 @@ async def decider_node(state: BrowserAgentState) -> dict:
     model_with_tools = model.bind_tools(BROWSER_TOOLS)
 
     context_parts = [f"GOAL: {state['goal']}\n\n"]
-    context_parts.append(f"GOAL STEPS: {state.get('goal_steps', '')}")
+    # context_parts.append(f"GOAL STEPS: {state.get('goal_steps', '')}")
     
-    # if state.get("suggested_step"):
-    #     context_parts.append(f"Latest Observation : \n{state['suggested_step']}\n\n")
+    if state.get("suggested_step"):
+        context_parts.append(f"Suggested next step : \n{state['suggested_step']}\n\n")
 
     if state.get("last_snapshot"):
         context_parts.append(f"CHUNKED SNAPSHOT (This is not whole Snapshot) :\n{state['last_snapshot']}\n\n")
@@ -699,8 +743,20 @@ async def ref_validator_node(state: BrowserAgentState) -> dict:
         logger.info(f"Tool not need ref {tool_name}\n\n")
         return {"ref_validation_error": None, "ref_validation_count": 0}
     
-    actual_role = REF_LOOKUP[ref].get('role')
-
+    actual_role = None
+    logger.info(f"Checking ref {ref}\n\n")
+    
+    try : 
+        actual_role = REF_LOOKUP[ref].get('role')
+    except Exception as e:
+        logger.info(f"actual_role not found due to {e} \n\n")
+        snapshot = state.get("last_snapshot")
+        pattern = rf"(?m)^[ \t]*-[ \t]+'?([a-z]+)\b.*\[[^\]]*\bref={re.escape(ref)}[\],]"
+        m = re.search(pattern, snapshot)
+        actual_role = m.group(1) if m else None
+        logger.info(f"Role name : {actual_role}")
+        
+        
     if actual_role is None:
         error = (
             f"Ref '{ref}' was not found in the most recent snapshot. "
