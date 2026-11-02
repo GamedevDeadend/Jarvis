@@ -255,53 +255,6 @@ async def observer_node(state: BrowserAgentState) -> dict:
         "last_snapshot_taken": True,
     }
     
-
-CHUNK_OBSERVER_PROPMPT = """You are Chunk Observer Agent. You are part of browser automation system which has tools like click, type, goback, navigate.
-On each step you are provided with series of snapshot.
-As a agent you have to observe one snapshot at a time. And Give best candidate ref id among it which can help reach our goal.
-
-For example :
-
-Best_Candidate : Button with ref e10 because this is product page.
-Best_Candidate : Searchbox with ref e20 because this can be used to search product.
-
-Anything along those lines.
-
-NOTE : As There will be multiple snapshot you can also give your observation as PASS.
-NOTE : Don't Focus on non interactable elements like heading, paragraph, text, img.
-
-Recent Snapshot : 
-
-{snapshot}
-"""
-
-async def make_observation(snapshot, goal, i:int, j:int):
-
-    model = ChatOllama(model=MODEL_ID, temperature=0,  num_predict=2048)
-
-    messages = [SystemMessage(content=CHUNK_OBSERVER_PROPMPT.format(snapshot=snapshot[i:j])),
-                HumanMessage(content = f"This is Goal : {goal}")]
-
-    result = await model.ainvoke(messages)
-
-    logging.info(f"Observation : {result.content}\n\n")
-    return result
-
-CHUNK_SELECTOR_PROMPT = """These are all the observations of various web snapshot.
-You have to decide which observation is best direction to achieve Goal.
-Keyword PASS means in that observation there was nothing relevant to goal
-
-RULE: Base your choice only on what's stated in the observations below — do not assume content not mentioned.
-RULE: If multiple observations look equally relevant, prefer the one whose candidate ref most directly matches an action the goal requires (e.g. a search box for a search goal, a specific product/video link for an open/play goal).
-
-Make sure to return Non-Zero Index 
-
-\n\n All observations : {obs}
-"""
-
-class Best_Observation(BaseModel):
-    index : int = Field (description="Give Non-Zero Index of best observation from all the observation")
-    reason : str = Field (description="Reason to select this observation")
     
 async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
     """
@@ -328,8 +281,6 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
     if rem > 0 :
             total_chunks  = total_chunks+1
     
-    observations = {}
-    snapshot_chunks = {}
     start_index = 0
     end_index = 0
     
@@ -345,15 +296,12 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
         end_index = min(end_index, current_ss_length)
         
         while end_index < current_ss_length and snapshot[end_index] != "\n":
-            end_index += 1
-
-        # result = await make_observation(snapshot, goal, start_index, end_index)
+            end_index += 1        
         
-        
-        snapshot_chunks[i+1] = snapshot[start_index : end_index]
+        current_chunk = snapshot[start_index : end_index]
         
         payload = {
-            "state" : f" This chunk of snapshot of current webpage  : {snapshot_chunks[i+1]}",
+            "state" : f" This chunk of snapshot of current webpage  : {current_chunk}",
             "questions" : {
                 f"Relevancy_Score_{i+1}" : Score(
                     instructions = f"""How relevant / close this snapshot chunk is to the goal? 
@@ -365,44 +313,28 @@ async def snapshot_optimizer_node(state:BrowserAgentState)->dict:
         
         result  = await classifier.ainvoke(payload)
         score = result.scores[f"Relevancy_Score_{i+1}"].score
-        snapshot_lookup[ score ] = snapshot_chunks[i+1]
         
         if score > max_score:
             max_score = score
-
-        observations[i+1] = result
         
+        snapshot_lookup[ score ] = current_chunk
         start_index = end_index
         
+     
+    for  score in snapshot_lookup.keys():
+        logging.info(f"score : {score} \n\n Snapshot : {snapshot_lookup[score][:200]}\n\n")
         
-    for  row in snapshot_lookup.keys():
-        logging.info(f"score : {row} \n\n Snapshot : {snapshot_lookup[row][:5000]}\n\n")
-        
-        
-    
-    model = ChatOllama(model=MODEL_ID, temperature=0,  num_predict=2048)
-    model_with_structured_output = model.with_structured_output(Best_Observation)
-    
-    combined_obs = "\n\n".join(f"{k} : {v}" for k, v in observations.items())
-    
-    messages = [SystemMessage(content=CHUNK_SELECTOR_PROMPT.format(obs=combined_obs)),
-                    HumanMessage(content = f"This is a goal :{goal}")]
-    
-    result = await model_with_structured_output.ainvoke(messages)
-    logging.info(f"Final Obs Index {result.index}\n Reason : {result.reason}\n\n")
-    
-    best_chunk = snapshot_chunks.get(result.index)
+    best_chunk = snapshot_lookup.get(max_score)
     
     if(best_chunk is None):
         logging.info(f"Best Chunk is None. Using first chunk as best chunk \n\n")
-        best_chunk = snapshot_chunks.get(1)
+        best_chunk = snapshot_lookup.get(list(snapshot_lookup.keys())[0])
     
     logging.info(f" Length of new SS : {len(best_chunk)}\n\nSS : {best_chunk[:5000]}\n\n")
     
     return {
         "last_snapshot_taken": True,
-        "last_snapshot" : best_chunk,
-        "suggested_step" : observations.get(result.index)
+        "last_snapshot" : best_chunk
     }
 
 
@@ -642,8 +574,8 @@ async def decider_node(state: BrowserAgentState) -> dict:
     context_parts = [f"GOAL: {state['goal']}\n\n"]
     # context_parts.append(f"GOAL STEPS: {state.get('goal_steps', '')}")
     
-    if state.get("suggested_step"):
-        context_parts.append(f"Suggested next step : \n{state['suggested_step']}\n\n")
+    # if state.get("suggested_step"):
+    #     context_parts.append(f"Suggested next step : \n{state['suggested_step']}\n\n")
 
     if state.get("last_snapshot"):
         context_parts.append(f"CHUNKED SNAPSHOT (This is not whole Snapshot) :\n{state['last_snapshot']}\n\n")
