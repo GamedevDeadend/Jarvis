@@ -11,6 +11,7 @@ below.
 |---|---|---|
 | Browser Automation | 🟡 Partially working, actively debugging | [browser/README.md](browser/README.md) |
 | Voice (STT/TTS) | 🟡 Built, not yet wired to orchestrator | [voice/README.md](voice/README.md) |
+| job_finder | 🟡 Built, not yet wired to orchestrator | [job_finder/README.md](job_finder/README.md) |
 | Orchestrator | ⚪ Designed, not yet implemented | see Planned Architecture below |
 | File Operations Agent | ⚪ Not started | — |
 | Knowledge Agent (RAG) | ⚪ Not started | — |
