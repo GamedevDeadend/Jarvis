@@ -1,6 +1,7 @@
 import logging
 import time
 
+from pathlib import Path
 from langgraph.graph import END
 
 from job_finder.core.jf_database import get_unalerted, is_new, mark_alerted, save_job
@@ -46,12 +47,27 @@ def route_after_profile(state: AgentState) -> str:
 
 def fetch_jobs_node(state: AgentState) -> dict:
     jobs, failed = [], []
-    for source in SOURCES:
-        try:
-            jobs.extend(source())
-        except Exception as exc:
-            logger.warning("source %s failed: %s", source.__name__, exc)
-            failed.append(source.__name__)
+    
+    eval_only = state.get("eval_only", False)
+    
+    if(eval_only):
+        EVAL_PATH = Path(__file__).parent / "resources" / "eval_jobs.jsonl"
+        with open(EVAL_PATH, "r", encoding="utf-8") as f:
+            for line in f: 
+                if not line.strip():
+                    continue
+                
+                job = Job.model_validate_json(line)
+                jobs.append(job)
+                
+    else :
+        for source in SOURCES:
+            try:
+                jobs.extend(source())
+            except Exception as exc:
+                logger.warning("source %s failed: %s", source.__name__, exc)
+                failed.append(source.__name__)
+            
     return {"jobs": jobs,
             "stats": _stats(state, fetched=len(jobs), failed_sources=failed)}
 
@@ -59,6 +75,11 @@ def fetch_jobs_node(state: AgentState) -> dict:
 def dedup_node(state: AgentState) -> dict:
     """Drop ids already in the DB (accepted or rejected) and duplicate ids
     inside this fetch, which would otherwise break save_job."""
+    
+    if state.get("eval_only"):
+        return {"new_jobs": state.get("jobs", []), "stats": _stats(state, new=len(state.get("jobs", [])))}
+    
+    
     seen, new = set(), []
     for job in state.get("jobs", []):
         if job.id in seen or not is_new(job.id):
@@ -104,10 +125,31 @@ def persist_alert_node(state: AgentState) -> dict:
     accepted = state.get("accepted", [])
     rejected = state.get("rejected", [])
 
-    if state.get("dry_run"):
-        for job in accepted + rejected:
-            print(f"{job.decision:8} score={job.fit_score} | {job.title} at "
-                  f"{job.company} | {job.salary_text} | {job.reason}")
+    if state.get("eval_only"):
+        
+        jobs = accepted + rejected
+        
+        skips    = [j for j in jobs if j.label == "skip"]
+        accepted = [j for j in jobs if j.label == "accepted"]
+
+        false_alerts = [j for j in skips    if j.decision == "accepted"]   # your real accept value
+        missed       = [j for j in accepted if j.decision != "accepted"]
+        
+        for j in false_alerts:
+            print(f"WRONG ALERT: {j.title} | {j.company} | {j.location} | score={j.fit_score} | {j.reason}")
+        for j in missed:
+            print(f"MISSED:      {j.title} | {j.company} | decision={j.decision} | score={j.fit_score} | {j.reason}")
+        
+        if len(skips) == 0 or len(accepted) == 0:
+            print("No jobs to evaluate. Please label some jobs first.")
+            return {"stats": _stats(state, retried=0, post_failures=0)}
+        
+        false_alert_rate = len(false_alerts) / len(skips)
+        miss_rate        = len(missed) / len(accepted)
+
+        print(f"False alerts: {len(false_alerts)}/{len(skips)} = {false_alert_rate:.1%}")
+        print(f"Missed:       {len(missed)}/{len(accepted)} = {miss_rate:.1%}")
+        print("Total jobs evaluated:", len(jobs))
         return {"stats": _stats(state, retried=0, post_failures=0)}
 
     retried = failures = 0
@@ -143,7 +185,7 @@ def heartbeat_node(state: AgentState) -> dict:
     )
     if s.get("failed_sources"):
         message += f", failed sources: {', '.join(s['failed_sources'])}"
-    if state.get("dry_run"):
+    if state.get("eval_only"):
         print(message)
     else:
         notify_heartbeat(message)

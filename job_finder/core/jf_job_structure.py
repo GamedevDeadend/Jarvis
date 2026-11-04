@@ -16,3 +16,6 @@ class Job(BaseModel):
     fit_score: int | None = Field(None, description="Fit score for the job")
     decision : Literal["accepted", "rejected"] = Field("accepted", description="Decision on the job")
     reason: str | None = Field(None, description="Why it was accepted or rejected")
+    
+    #Only Uncomment the below line if you want to use the label field for evaluation purposes
+    label: str = Field("accepted", description="Label for evaluation purposes")

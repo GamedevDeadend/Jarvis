@@ -51,20 +51,20 @@ def build_graph():
     return g.compile()
 
 
-def run_cycle(dry_run: bool = False) -> dict:
+def run_cycle(eval_only: bool = False) -> dict:
     """One full cycle. Plain function so a future orchestrator can call it
     as a worker. Returns the final state."""
     init_db()
     graph = build_graph()
-    return graph.invoke({"rejected": [], "stats": {}, "dry_run": dry_run})
+    return graph.invoke({"rejected": [], "stats": {}, "eval_only": eval_only})
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry", action="store_true",
-                        help="print verdicts only: no DB writes, no Discord posts")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="print and evaluate verdicts only: no DB writes, no Discord posts")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    run_cycle(dry_run=args.dry)
+    run_cycle(eval_only=args.eval_only)

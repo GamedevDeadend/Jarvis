@@ -16,5 +16,5 @@ class AgentState(TypedDict, total=False):
     rejected: Annotated[list[Job], operator.add]
 
     stats: dict              # counts for the heartbeat
-    dry_run: bool
+    eval_only: bool
     abort: bool              # set by ensure_profile to end the cycle
